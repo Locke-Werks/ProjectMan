@@ -1,0 +1,44 @@
+// Generated from res/projectman.rc.in by configure_file. Edit the .in file.
+// Configured twice, once per binary: the version fields all derive from
+// cmake/Version.cmake, and the three name fields are set per target.
+#include <windows.h>
+
+#define IDI_APPICON 1
+
+// Declared first so Explorer picks it as the file icon.
+IDI_APPICON ICON "@PM_ICON_PATH@"
+
+VS_VERSION_INFO VERSIONINFO
+    FILEVERSION    @PM_VERSION_RC@
+    PRODUCTVERSION @PM_VERSION_RC@
+    FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+    FILEFLAGS      VS_FF_DEBUG
+#else
+    FILEFLAGS      0x0L
+#endif
+    FILEOS         VOS_NT_WINDOWS32
+    FILETYPE       VFT_APP
+    FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "@PM_COMPANY@"
+            VALUE "FileDescription",  "@PM_RC_DESCRIPTION@"
+            VALUE "FileVersion",      "@PM_VERSION_RC_STR@"
+            VALUE "InternalName",     "@PM_RC_INTERNAL_NAME@"
+            VALUE "LegalCopyright",   "@PM_COPYRIGHT@"
+            VALUE "OriginalFilename", "@PM_RC_ORIGINAL_FILENAME@"
+            VALUE "ProductName",      "@PM_PRODUCT@"
+            VALUE "ProductVersion",   "@PM_VERSION_RC_STR@"
+        END
+    END
+
+    BLOCK "VarFileInfo"
+    BEGIN
+        // US English, Unicode. Must agree with the StringFileInfo block above.
+        VALUE "Translation", 0x409, 1200
+    END
+END

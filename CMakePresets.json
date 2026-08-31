@@ -1,0 +1,58 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 28, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "installDir": "${sourceDir}/build/${presetName}/install",
+      "cacheVariables": {
+        "CMAKE_PREFIX_PATH": "$env{QT_ROOT_DIR}"
+      }
+    },
+    {
+      "name": "msvc",
+      "hidden": true,
+      "inherits": "base",
+      "description": "Deliberately does NOT name a generator. CMake's default on Windows is the newest installed Visual Studio, which finds its own toolset and therefore needs no vcvars in any shell. Pinning a year breaks the moment a machine moves on: naming 'Visual Studio 17 2022' failed on a GitHub runner that had upgraded to VS 2026, with 'could not find any instance of Visual Studio'. The architecture is left unset too, because VS generators already default to the host platform, and CMakeLists.txt fails the configure outright if it ever is not."
+    },
+    {
+      "name": "vs",
+      "displayName": "Visual Studio, whatever is installed",
+      "description": "Works from any shell. No vcvars needed. Use this if in doubt. Set QT_ROOT_DIR, or pass -DCMAKE_PREFIX_PATH=C:/Qt/6.8.3/msvc2022_64.",
+      "inherits": "msvc"
+    },
+    {
+      "name": "ci",
+      "displayName": "CI: warnings are errors",
+      "inherits": "msvc",
+      "cacheVariables": {
+        "PM_WERROR": "ON",
+        "PM_HARDENING": "ON"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "The shippable binaries",
+      "inherits": "msvc",
+      "cacheVariables": {
+        "PM_HARDENING": "ON"
+      }
+    },
+    {
+      "name": "dev",
+      "displayName": "Ninja debug",
+      "description": "Faster incremental builds, but Ninja does not find cl.exe on its own: run it from an x64 Native Tools prompt.",
+      "inherits": "base",
+      "generator": "Ninja",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "vs", "configurePreset": "vs", "configuration": "Debug" },
+    { "name": "ci", "configurePreset": "ci", "configuration": "RelWithDebInfo" },
+    { "name": "release", "configurePreset": "release", "configuration": "Release" },
+    { "name": "dev", "configurePreset": "dev" }
+  ]
+}
