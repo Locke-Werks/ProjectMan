@@ -5,6 +5,25 @@ current terminal to Claude Code in the one you pick. `ProjectMan.exe` shows the
 same data as a desktop dashboard and launches into a new Windows Terminal
 window.
 
+New in 0.2.0: DOCK, `Ctrl+K`, or `pm dock <name>` puts the session in a [Docked
+Console](https://github.com/Locke-Werks/dockedconsole) column instead of a
+window of its own. No dock running starts one, a column with room takes a
+horizontal split, a full column gets a new column, and three columns at their
+pane cap refuses rather than falling back to a loose window. Needs Docked
+Console 0.4.0 or newer; if it is not installed, ProjectMan offers the signed
+installer.
+
+ProjectMan does not run `wt` for this. Windows Terminal keeps elevated and
+unelevated windows in separate monarch worlds, and an unelevated `wt` aimed at
+an elevated one does not fail: it creates a new window that permanently owns the
+name, so every later pane meant for that column lands in the stray window.
+ProjectMan sends the dock a request and the dock splits itself.
+
+Also fixed in 0.2.0: a session launched from inside another Claude Code session
+inherited that session's `CLAUDE_CODE_CHILD_SESSION` marker and started with its
+transcript turned off. Every launch path now builds its own environment. And
+`pm open`, which is meant to open a plain shell, was opening Claude Code.
+
 `pm dispatch`, or Ctrl+D in either front end, lists every outstanding item
 across the tree as a checklist. Tick what you want worked and one Claude Code
 session starts with each selected repository attached and a briefing of what is
