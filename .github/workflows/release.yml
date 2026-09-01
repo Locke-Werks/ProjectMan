@@ -1,0 +1,186 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+env:
+  QT_VERSION: 6.8.3
+  # Pinned. A Forge release cannot silently change what this job produces.
+  # v0.3.0 or later is required: [[options]] and `when` are ignored rather than
+  # rejected by older builds, which inverts them instead of disabling them, and
+  # this installer gates its PATH entry on one.
+  FORGE_VERSION: v0.3.0
+
+jobs:
+  release:
+    runs-on: windows-latest
+    environment: release
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches the declared version
+        shell: pwsh
+        run: |
+          $tag   = "${{ github.ref_name }}" -replace '^v', ''
+          $toml  = (Select-String -Path installer.toml -Pattern '^\s*version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          $major = (Select-String -Path cmake/Version.cmake -Pattern 'PM_VERSION_MAJOR (\d+)').Matches[0].Groups[1].Value
+          $minor = (Select-String -Path cmake/Version.cmake -Pattern 'PM_VERSION_MINOR (\d+)').Matches[0].Groups[1].Value
+          $patch = (Select-String -Path cmake/Version.cmake -Pattern 'PM_VERSION_PATCH (\d+)').Matches[0].Groups[1].Value
+          $cmake = "$major.$minor.$patch"
+          "tag=$tag  installer.toml=$toml  Version.cmake=$cmake"
+          if ($tag -ne $toml)  { throw "tag $tag does not match installer.toml $toml" }
+          if ($tag -ne $cmake) { throw "tag $tag does not match cmake/Version.cmake $cmake" }
+
+      - name: Install Qt ${{ env.QT_VERSION }}
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          cache: true
+
+      # No vcvars, and no pinned generator: CMake picks the newest Visual Studio
+      # on the box, which finds its own toolset. Naming a VS year breaks when
+      # the runner image moves on, which it did.
+      - name: Build
+        run: |
+          cmake --preset release
+          cmake --build --preset release
+
+      - name: Stage the payload
+        shell: pwsh
+        run: |
+          ./scripts/stage-payload.ps1 -BuildDir build/release -Config Release
+          if ($LASTEXITCODE -ne 0) { throw 'staging failed' }
+
+      # Only our own binaries. Everything else in the payload belongs to Qt, and
+      # the signing action takes a folder rather than a filter, so ours are
+      # isolated into one instead.
+      - name: Collect our binaries for signing
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path build/tosign | Out-Null
+          Get-Content build/payload-ours.txt |
+            Where-Object { $_ -and $_.Trim() } |
+            ForEach-Object { Copy-Item $_ build/tosign/ }
+          Get-ChildItem build/tosign | Select-Object Name, Length
+
+      # Before forging. Forge hashes payload members into the container and
+      # extracts them verbatim, so an unsigned binary going in stays unsigned on
+      # the installed machine, and signing the finished installer does nothing
+      # for it.
+      - name: Sign the payload
+        uses: azure/trusted-signing-action@v0
+        with:
+          azure-tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          azure-client-id: ${{ vars.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: https://eus.codesigning.azure.net
+          trusted-signing-account-name: specterpoint
+          certificate-profile-name: specterpoint
+          files-folder: build/tosign
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      # Certificates are valid three days, so the timestamp is what keeps a
+      # signature valid past that. An untimestamped signature would verify today
+      # and fail next week.
+      - name: Verify the payload signatures and copy them back
+        shell: pwsh
+        run: |
+          foreach ($f in Get-ChildItem build/tosign -Filter *.exe) {
+            $sig = Get-AuthenticodeSignature $f.FullName
+            "$($f.Name) : $($sig.Status)  $($sig.SignerCertificate.Subject)"
+            if ($sig.Status -ne 'Valid') { throw "$($f.Name) is $($sig.Status)" }
+            if (-not $sig.TimeStamperCertificate) { throw "$($f.Name) is not timestamped" }
+            Copy-Item $f.FullName (Join-Path 'stage' $f.Name) -Force
+          }
+
+      - name: Fetch Forge
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download $env:FORGE_VERSION --repo Locke-Werks/Forge `
+            --pattern '*.exe' --dir tools
+          foreach ($name in 'lwforge.exe', 'lwstub.exe') {
+            $sig = Get-AuthenticodeSignature "tools/$name"
+            "$name : $($sig.Status)"
+            if ($sig.Status -ne 'Valid') { throw "tools/$name is $($sig.Status)" }
+          }
+
+      # No --sign here. That flag shells out to scripts/sign.ps1 resolved against
+      # the working directory, which only exists inside the Forge repo.
+      - name: Forge the installer
+        shell: pwsh
+        run: |
+          ./tools/lwforge.exe build `
+            --config installer.toml `
+            --payload stage `
+            --stub tools/lwstub.exe `
+            --out dist/ProjectMan-Setup.exe
+
+      # Signed last, after resource stamping and the container append have
+      # rewritten the image.
+      - name: Sign the installer
+        uses: azure/trusted-signing-action@v0
+        with:
+          azure-tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          azure-client-id: ${{ vars.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: https://eus.codesigning.azure.net
+          trusted-signing-account-name: specterpoint
+          certificate-profile-name: specterpoint
+          files-folder: dist
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Verify the installer
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature dist/ProjectMan-Setup.exe
+          "installer: $($sig.Status)  $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') { throw "installer is $($sig.Status)" }
+
+          # Signing appended a certificate table after the container. This
+          # proves it did not orphan the payload.
+          ./tools/lwforge.exe inspect dist/ProjectMan-Setup.exe
+          if ($LASTEXITCODE -ne 0) { throw 'the signed installer cannot read its own container' }
+
+      - name: Verify the option surface
+        shell: pwsh
+        run: |
+          $report = & dist/ProjectMan-Setup.exe --check-only /O:add_to_path=on /O:start_menu=off 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          $report
+
+          # An option id the installer does not declare is a real defect.
+          if ($report -match 'not declared|does not declare|unknown option') {
+            throw "the installer rejected an option id it is supposed to declare`n$report"
+          }
+
+          # Any other non-zero here is the runner failing one of our preflights,
+          # which is a property of the runner rather than a defect in the
+          # installer. The os_build floor is Windows 11 and hosted runners are
+          # often Server builds.
+          if ($code -ne 0) {
+            Write-Host "::warning::--check-only exited $code, which is expected when the runner itself fails a preflight"
+          }
+
+      - name: Publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist/ProjectMan-Setup.exe `
+            --title "ProjectMan ${{ github.ref_name }}" `
+            --notes-file .github/release-notes.md

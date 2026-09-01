@@ -60,5 +60,12 @@ function(pm_deploy_qt target)
                 PATTERN "*.pdb" EXCLUDE
                 PATTERN "*.ilk" EXCLUDE
                 PATTERN "*.exp" EXCLUDE
-                PATTERN "*.lib" EXCLUDE)
+                PATTERN "*.lib" EXCLUDE
+                # windeployqt stages the DirectX shader compiler for Qt's RHI
+                # backends. A Widgets application paints through the raster
+                # engine and never loads either, and together they are 16 MB of
+                # a 42 MB payload. Verified by running the staged tree without
+                # them.
+                PATTERN "dxcompiler.dll" EXCLUDE
+                PATTERN "dxil.dll" EXCLUDE)
 endfunction()

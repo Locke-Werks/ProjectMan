@@ -1,0 +1,98 @@
+# Forge installer configuration. Schema: Locke-Werks/Forge docs/config-schema.md
+#
+# Paths use literal strings so a backslash stays a backslash. A TOML basic string
+# would read "\b" in "{InstallDir}\bin" as a backspace.
+
+[product]
+name         = "ProjectMan"
+version      = "0.1.0"
+publisher    = "Locke Werks"
+description  = "A control surface over your projects tree"
+copyright    = "Copyright (C) 2026 Locke Werks"
+url          = "https://github.com/Locke-Werks/ProjectMan"
+icon         = "assets/projectman.ico"
+# Stable across versions. Keys the upgrade path, so it must never change.
+upgrade_code = "6f3c9a24-1e57-4b8d-a0f2-7d51c8e93b46"
+aumid        = "LockeWerks.ProjectMan"
+
+[install]
+scope     = "machine"
+dir       = '{ProgramFiles}\Locke Werks\ProjectMan'
+elevation = "required"
+
+[ui]
+license_text = """
+ProjectMan
+Copyright (C) 2026 Locke Werks
+
+This program is free software: you can redistribute it and/or modify it under the
+terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with this
+program. If not, see <https://www.gnu.org/licenses/>.
+
+Chakra Petch and Outfit are bundled under the SIL Open Font License 1.1.
+
+The complete source is at https://github.com/Locke-Werks/ProjectMan
+"""
+
+# Windows 11 22000. The launcher targets Windows Terminal, an inbox component
+# from 11 onward, and the console front end assumes a VT-capable conhost.
+[[preflight]]
+type = "os_build"
+min  = 22000
+fail = "ProjectMan needs Windows 11 or newer."
+
+# Neither binary can be overwritten while it is running.
+[[preflight]]
+type            = "process_not_running"
+name            = "ProjectMan.exe"
+restart_manager = true
+fail            = "ProjectMan is running. Close it and try again."
+
+[[preflight]]
+type            = "process_not_running"
+name            = "pm.exe"
+restart_manager = true
+fail            = "pm is running in a terminal somewhere. Quit it with Ctrl+Q and try again."
+
+# 120 MB. The payload is two of our own binaries plus the Qt runtime, which is
+# the bulk of it, and this also covers the installer's own extraction.
+[[preflight]]
+type  = "free_disk_space"
+bytes = 125829120
+fail  = "ProjectMan needs about 120 MB free on the install volume."
+
+[[options]]
+id      = "start_menu"
+label   = "Add a Start Menu shortcut"
+detail  = "Puts ProjectMan in the Start Menu for everyone on this machine."
+default = true
+
+[[options]]
+id      = "add_to_path"
+label   = "Put pm on PATH"
+detail  = "Adds the install directory to the system PATH so `pm` works from any terminal. This is the whole point of the console front end."
+default = true
+
+[[actions]]
+type   = "shortcut"
+target = '{InstallDir}\ProjectMan.exe'
+name   = "ProjectMan"
+when   = "start_menu"
+
+# Native to Forge, so `pm` resolves without shipping a shim into a directory
+# that happens to be on PATH already.
+[[actions]]
+type  = "path_append"
+value = '{InstallDir}'
+when  = "add_to_path"
+
+[[actions]]
+type = "arp"

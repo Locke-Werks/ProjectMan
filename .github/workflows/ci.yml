@@ -1,0 +1,122 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+env:
+  QT_VERSION: 6.8.3
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # install-qt-action exports QT_ROOT_DIR, which the base preset reads into
+      # CMAKE_PREFIX_PATH. Nothing here hardcodes a Qt path.
+      - name: Install Qt ${{ env.QT_VERSION }}
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          cache: true
+
+      # No setup step and no vcvars. The preset names no generator, so CMake
+      # picks the newest Visual Studio on the box and that generator finds its
+      # own toolset. Pinning a VS year fails the day the image moves:
+      # "Visual Studio 17 2022" stopped resolving when windows-latest became
+      # windows-2025-vs2026.
+      - name: Configure
+        run: cmake --preset ci
+
+      - name: Report the toolchain actually used
+        shell: pwsh
+        run: |
+          Select-String -Path build/ci/CMakeCache.txt -Pattern '^CMAKE_GENERATOR:|^CMAKE_CXX_COMPILER:' |
+            ForEach-Object { $_.Line }
+
+      # /WX is on in this preset. A new warning stops the line here rather than
+      # on somebody's machine.
+      - name: Build
+        run: cmake --build --preset ci
+
+      # --config is required: the Visual Studio generator is multi-config, so
+      # the install rule cannot infer which one to take.
+      - name: Stage
+        shell: pwsh
+        run: |
+          ./scripts/stage-payload.ps1 -BuildDir build/ci -Config RelWithDebInfo
+          if ($LASTEXITCODE -ne 0) { throw 'staging failed' }
+
+      # src/core is Qt-free on purpose, so that pm.exe, the binary that goes on
+      # PATH, is a single standalone file. Nothing in the type system enforces
+      # that: one #include <QString> in core would silently start dragging
+      # Qt6Core.dll along, and it would only be noticed by someone copying
+      # pm.exe somewhere and watching it fail to start.
+      #
+      # The image is scanned directly rather than through dumpbin, because
+      # locating dumpbin means hardcoding a Visual Studio path, and a hardcoded
+      # VS year is exactly what breaks when a runner image moves.
+      - name: Check pm.exe links no Qt
+        shell: pwsh
+        run: |
+          $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path 'stage/pm.exe'))
+          $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+
+          # Positive control first. A scan that cannot see the imports we know
+          # are there would report "no Qt" for any input at all, and a check
+          # that cannot fail is worse than no check.
+          $expected = [regex]::Matches($ascii, '(?i)\b(KERNEL32|SHELL32|USER32|ole32)\.dll') |
+                      ForEach-Object { $_.Value.ToUpper() } | Sort-Object -Unique
+          "import names visible to the scan: $($expected -join ', ')"
+          if ($expected.Count -lt 3) {
+            throw "the scan found only $($expected.Count) of the system DLLs pm.exe certainly imports, so it is not reading the import table"
+          }
+
+          $qt = [regex]::Matches($ascii, '(?i)Qt\d?(Core|Gui|Widgets|Network|Svg)\.dll') |
+                ForEach-Object { $_.Value } | Sort-Object -Unique
+          if ($qt) {
+            throw "pm.exe imports Qt ($($qt -join ', ')); src/core is no longer Qt-free"
+          }
+          'no Qt import: pm.exe is standalone'
+
+      # The release job asserts the tag matches both version strings. Checking
+      # they match each other on every push means a release never fails on a
+      # mismatch introduced weeks earlier.
+      - name: Check versions agree
+        shell: pwsh
+        run: |
+          $toml  = (Select-String -Path installer.toml -Pattern '^\s*version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          $major = (Select-String -Path cmake/Version.cmake -Pattern 'PM_VERSION_MAJOR (\d+)').Matches[0].Groups[1].Value
+          $minor = (Select-String -Path cmake/Version.cmake -Pattern 'PM_VERSION_MINOR (\d+)').Matches[0].Groups[1].Value
+          $patch = (Select-String -Path cmake/Version.cmake -Pattern 'PM_VERSION_PATCH (\d+)').Matches[0].Groups[1].Value
+          $cmake = "$major.$minor.$patch"
+          "installer.toml=$toml  Version.cmake=$cmake"
+          if ($toml -ne $cmake) { throw "installer.toml $toml does not match Version.cmake $cmake" }
+
+          # Catches a stale generated resource, which is the one new failure
+          # mode configure_file introduces.
+          foreach ($name in 'pm.exe', 'ProjectMan.exe') {
+            $v = (Get-Item "stage/$name").VersionInfo.ProductVersion
+            "  $name VERSIONINFO=$v"
+            if ($v -notlike "$cmake*") { throw "$name VERSIONINFO $v does not match Version.cmake $cmake" }
+          }
+
+      # Proves the payload is complete. A missing platform plugin does not fail
+      # the build, it fails the first launch on someone else's machine with
+      # "could not find or load the Qt platform plugin windows".
+      - name: Check the staged tree is self-contained
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'stage/platforms/qwindows.dll')) {
+            throw 'stage/platforms/qwindows.dll is missing; windeployqt did not run or its output was not installed'
+          }
+          $n = (Get-ChildItem stage -Recurse -File).Count
+          $mb = (Get-ChildItem stage -Recurse -File | Measure-Object -Property Length -Sum).Sum / 1MB
+          '{0} files, {1:N1} MB' -f $n, $mb
