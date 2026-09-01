@@ -24,6 +24,7 @@ enum class WorkKind {
 struct WorkItem {
     WorkKind    kind = WorkKind::Uncommitted;
     std::string project;      // display name
+    std::string ownerRepo;    // "nyxlocke/BitsyGo", empty when there is no remote
     fs::path    path;         // the repo the work happens in
     std::string summary;      // "48 uncommitted files on master"
     std::string detail;       // extra context for the briefing; may be empty

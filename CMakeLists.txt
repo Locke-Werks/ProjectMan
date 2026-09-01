@@ -31,6 +31,7 @@ include(Dependencies)
 include(Warnings)
 include(Hardening)
 include(Manifest)
+include(DeployQt)
 
 # The CRT is deliberately left at the default dynamic /MD. Docked Console links
 # the static CRT because it ships one self-contained exe; ProjectMan.exe loads

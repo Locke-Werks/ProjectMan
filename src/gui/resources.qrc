@@ -1,0 +1,12 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+  <qresource prefix="/">
+    <file alias="projectman.ico">../../assets/projectman.ico</file>
+  </qresource>
+  <qresource prefix="/fonts">
+    <file alias="ChakraPetch-Regular.ttf">../../assets/fonts/ChakraPetch-Regular.ttf</file>
+    <file alias="ChakraPetch-SemiBold.ttf">../../assets/fonts/ChakraPetch-SemiBold.ttf</file>
+    <file alias="ChakraPetch-Bold.ttf">../../assets/fonts/ChakraPetch-Bold.ttf</file>
+    <file alias="Outfit-Variable.ttf">../../assets/fonts/Outfit-Variable.ttf</file>
+  </qresource>
+</RCC>

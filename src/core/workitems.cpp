@@ -18,7 +18,8 @@ void add(WorkList& out, WorkKind kind, const Project& p, int count,
 {
     WorkItem w;
     w.kind    = kind;
-    w.project = p.displayName();
+    w.project   = p.displayName();
+    w.ownerRepo = p.ownerRepo;
     w.path    = p.path;
     w.count   = count;
     w.summary = std::move(summary);
@@ -139,6 +140,7 @@ WorkList collectWorkItems(const ProjectList& projects)
 void preselect(WorkList& items, int maxRepos)
 {
     std::set<std::string> repos;
+    std::set<std::string> remoteWork;
 
     for (WorkItem& w : items) {
         w.selected = false;
@@ -152,6 +154,20 @@ void preselect(WorkList& items, int maxRepos)
                              || w.kind == WorkKind::OpenIssue;
         if (!actionable)
             continue;
+
+        // A pull request or issue belongs to the remote, not to a working tree,
+        // and several repositories here are checked out two or three times.
+        // Selecting both BitsyGo and security-reviews/BitsyGo would send the
+        // agent at the same two pull requests twice, in two directories.
+        // Uncommitted work is the opposite: it exists only in one tree, so it
+        // is never deduplicated this way.
+        const bool remote = w.kind == WorkKind::OpenPr || w.kind == WorkKind::OpenIssue;
+        if (remote && !w.ownerRepo.empty()) {
+            const std::string key = toLower(w.ownerRepo) + "/"
+                                  + std::to_string(static_cast<int>(w.kind));
+            if (!remoteWork.insert(key).second)
+                continue;
+        }
 
         const std::string key = w.path.string();
         if (!repos.count(key) && static_cast<int>(repos.size()) >= maxRepos)
