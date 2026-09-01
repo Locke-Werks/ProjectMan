@@ -209,6 +209,13 @@ jobs:
             }
           }
 
+          # The pwsh wrapper fails the step on a non-zero $LASTEXITCODE left by
+          # the last native command, and the last one here is the MCP installer
+          # refusing a runner that has no ProjectMan on it. That refusal is the
+          # thing this step exists to see working. Anything genuinely wrong has
+          # already thrown above.
+          exit 0
+
       - name: Publish
         shell: pwsh
         env:
