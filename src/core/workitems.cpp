@@ -178,6 +178,18 @@ void preselect(WorkList& items, int maxRepos)
     }
 }
 
+std::string dispatchSummary(Autonomy a)
+{
+    switch (a) {
+    case Autonomy::Suggest: return "Will report only, and change nothing.";
+    case Autonomy::Write:   return "Will edit the working tree, never commit.";
+    case Autonomy::Commit:  return "Will commit, never push.";
+    case Autonomy::Push:    return "Will commit and push a branch.";
+    case Autonomy::Full:    return "Will commit, push, and open pull requests.";
+    }
+    return {};
+}
+
 DispatchPlan buildDispatchPlan(const WorkList& items, const DispatchOptions& opt)
 {
     DispatchPlan plan;
@@ -186,6 +198,10 @@ DispatchPlan buildDispatchPlan(const WorkList& items, const DispatchOptions& opt
     for (const WorkItem& w : items) {
         if (!w.selected)
             continue;
+        // A briefing long enough to bury its own instructions is worse than one
+        // that says it was truncated.
+        if (opt.maxItems > 0 && static_cast<int>(plan.items.size()) >= opt.maxItems)
+            break;
         plan.items.push_back(w);
         if (seen.insert(w.path.string()).second)
             plan.repos.push_back(w.path);
@@ -216,33 +232,73 @@ DispatchPlan buildDispatchPlan(const WorkList& items, const DispatchOptions& opt
         os << "\n";
     }
 
+    // The autonomy ladder, spelled out. Each rung states its own ceiling
+    // explicitly rather than leaving it to be inferred from silence, because
+    // "it was not forbidden" is exactly how an agent talks itself past one.
+    //
+    // Collected first and numbered on the way out, so the lower rungs, which
+    // have one rule fewer, do not emit a list that skips a number.
+    std::vector<std::string> rules;
+    rules.emplace_back(
+        "Take the repositories one at a time. Read the actual state before "
+        "changing anything: this briefing is a snapshot and may be stale.");
+
+    switch (opt.autonomy) {
+    case Autonomy::Suggest:
+        rules.emplace_back("Change nothing. Read, and report what you would do "
+                           "and why.");
+        rules.emplace_back("Do not edit files, do not run commands that write, "
+                           "do not commit, and do not touch GitHub.");
+        break;
+
+    case Autonomy::Write:
+        rules.emplace_back("Where the right next step is clear, make the change.");
+        rules.emplace_back("Leave everything in the working tree. Do not commit, "
+                           "do not push, and do not touch GitHub. I want to read "
+                           "it as a diff.");
+        break;
+
+    case Autonomy::Commit:
+        rules.emplace_back("Where the right next step is clear, do it.");
+        rules.emplace_back("Commit finished work in the repository it belongs "
+                           "to, with a message in the imperative mood and no AI "
+                           "attribution trailer of any kind.");
+        rules.emplace_back("Do not push, do not open or merge pull requests, and "
+                           "do not write to GitHub. Everything stays on this "
+                           "machine for review.");
+        break;
+
+    case Autonomy::Push:
+        rules.emplace_back("Where the right next step is clear, do it.");
+        rules.emplace_back("Commit with a message in the imperative mood and no "
+                           "AI attribution trailer of any kind.");
+        rules.emplace_back("Push to a branch of your own. Never push to a default "
+                           "branch, never force-push, and do not open pull "
+                           "requests.");
+        break;
+
+    case Autonomy::Full:
+        rules.emplace_back("Where the right next step is clear, do it.");
+        rules.emplace_back("Commit with a message in the imperative mood and no "
+                           "AI attribution trailer of any kind.");
+        rules.emplace_back("Push to a branch and open a pull request against the "
+                           "default branch. Never merge one, never force-push, "
+                           "and never push to a default branch directly.");
+        break;
+    }
+
+    rules.emplace_back("Where a step is unclear, or a change would be "
+                       "destructive, irreversible, or a judgement call that is "
+                       "mine to make, stop and ask me. Asking is expected, not a "
+                       "failure.");
+    rules.emplace_back("Do not start work that was not listed above. If you find "
+                       "something else worth doing, tell me rather than doing it.");
+
     os << "How to work:\n\n";
-    os << "1. Take the repositories one at a time. Read the actual state before "
-          "changing anything: this briefing is a snapshot and may be stale.\n";
-    os << "2. Where the right next step is clear, do it.\n";
-    os << "3. Where it is not clear, or where a change would be destructive, "
-          "irreversible, or a judgement call that is mine to make, stop and ask "
-          "me. Asking is expected, not a failure.\n";
+    for (size_t i = 0; i < rules.size(); ++i)
+        os << (i + 1) << ". " << rules[i] << "\n";
 
-    if (opt.allowCommit) {
-        os << "4. Commit finished work in the repository it belongs to, with a "
-              "message in the imperative mood and no AI attribution trailer of "
-              "any kind.\n";
-    } else {
-        os << "4. Leave changes in the working tree. Do not commit.\n";
-    }
-
-    if (!opt.allowPush) {
-        os << "5. Do not push, do not open or merge pull requests, and do not "
-              "write to GitHub. Everything stays on this machine for review.\n";
-    } else {
-        os << "5. You may push to a branch. Do not merge to a default branch "
-              "without asking.\n";
-    }
-
-    os << "6. Do not start work that was not listed above. If you find something "
-          "else worth doing, tell me rather than doing it.\n\n";
-    os << "Begin by summarising what you intend to do in each repository, then "
+    os << "\nBegin by summarising what you intend to do in each repository, then "
           "work through them.\n";
 
     plan.briefing = os.str();

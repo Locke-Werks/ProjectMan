@@ -28,6 +28,10 @@ struct BrowseResult {
 // Run the interactive picker. Returns when the user chooses an action or quits.
 // The caller owns the console session and re-enters it if it wants the browser
 // back after a child exits.
-BrowseResult browse(ConsoleSession& con, ProjectList& projects, const Config& cfg);
+//
+// cfg is mutable because the settings view edits it in place and writes it out.
+// The caller's copy is the live one, so a change made here takes effect on the
+// next launch without a restart.
+BrowseResult browse(ConsoleSession& con, ProjectList& projects, Config& cfg);
 
 } // namespace pm::cli

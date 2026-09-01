@@ -1,5 +1,6 @@
 #pragma once
 
+#include "config.h"
 #include "model.h"
 
 #include <string>
@@ -55,10 +56,14 @@ struct DispatchPlan {
 };
 
 struct DispatchOptions {
-    bool allowCommit = true;
-    bool allowPush   = false;
-    int  maxRepos    = 8;
+    Autonomy autonomy = Autonomy::Commit;
+    int      maxRepos = 8;
+    int      maxItems = 40;
 };
+
+// What a dispatch at this rung will and will not do, in one line, for a
+// confirmation surface.
+std::string dispatchSummary(Autonomy a);
 
 // Build the plan from whatever the user ticked. Returns an empty plan when
 // nothing is selected.

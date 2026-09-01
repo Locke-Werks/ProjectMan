@@ -57,7 +57,8 @@ void printUsage()
         "  pm dispatch [options]       run one Claude Code session across repos\n"
         "  pm refresh                  refetch open pull requests and issues\n"
         "  pm doctor                   resolve git, claude and wt, and time a sweep\n"
-        "  pm config [--path|--init]   show, locate or write the config file\n"
+        "  pm config [show|get|set]    read or change settings\n"
+        "  pm settings                 edit settings interactively\n"
         "\n"
         "Options:\n"
         "  --dirty                     only projects with uncommitted changes\n"
@@ -407,11 +408,6 @@ int main(int argc, char** argv)
         cfg.save(nullptr);
     }
 
-    // Resolve "auto" once, here, so every later read and every printed value
-    // is the number actually used.
-    if (cfg.scanThreads <= 0)
-        cfg.scanThreads = defaultScanThreads();
-
     if (!a.root.empty())
         cfg.root = fs::path(widen(a.root));
     if (!a.sort.empty())
@@ -434,17 +430,58 @@ int main(int argc, char** argv)
             std::printf("wrote %s\n", Config::perUserPath().string().c_str());
             return kOk;
         }
-        std::printf("config    %s\n", Config::filePath().string().c_str());
-        std::printf("root      %s\n", cfg.root.string().c_str());
-        std::printf("claude    %s\n", cfg.resolveClaude().string().c_str());
-        std::printf("args      ");
-        for (const std::string& s : cfg.claudeArgs)
-            std::printf("%s ", s.c_str());
-        std::printf("\nterminal  %s\n", cfg.resolveTerminal().string().c_str());
-        std::printf("threads   %d\n", cfg.scanThreads);
-        std::printf("dispatch  commit=%s push=%s max_repos=%d\n",
-                    cfg.dispatchCommit ? "true" : "false",
-                    cfg.dispatchPush ? "true" : "false", cfg.dispatchMaxRepos);
+        const std::string sub = a.positional.empty() ? std::string() : a.positional[0];
+
+        // pm config set <key> <value...>
+        if (iequals(sub, "set")) {
+            if (a.positional.size() < 3)
+                return failWith(kUsage, "usage: pm config set <key> <value>");
+
+            // Everything after the key is the value, so a list or a path with
+            // spaces needs no quoting the shell has already eaten.
+            std::string value;
+            for (size_t i = 2; i < a.positional.size(); ++i)
+                value += (i > 2 ? " " : "") + a.positional[i];
+
+            std::string err;
+            if (!applySetting(cfg, a.positional[1], value, &err))
+                return failWith(kUsage, err);
+            if (!cfg.save(&err))
+                return fail(err);
+
+            std::printf("%-24s %s\n", a.positional[1].c_str(),
+                        readSetting(cfg, a.positional[1]).c_str());
+            return kOk;
+        }
+
+        if (iequals(sub, "get")) {
+            if (a.positional.size() < 2)
+                return failWith(kUsage, "usage: pm config get <key>");
+            if (!findSetting(a.positional[1]))
+                return failWith(kUsage, "unknown setting \"" + a.positional[1] + "\"");
+            std::printf("%s\n", readSetting(cfg, a.positional[1]).c_str());
+            return kOk;
+        }
+
+        if (!sub.empty() && !iequals(sub, "show"))
+            return failWith(kUsage, "usage: pm config [show|get <key>|set <key> <value>]");
+
+        std::printf("%s\n\n", Config::filePath().string().c_str());
+        for (const Setting& s : settings()) {
+            std::printf("  %-24s %-28s %s\n", s.key,
+                        readSetting(cfg, s.key).substr(0, 28).c_str(), s.help);
+        }
+        std::printf("\n  %s: %s\n", autonomyLabel(cfg.autonomy),
+                    autonomySummary(cfg.autonomy));
+        std::printf("  launch: claude %s\n",
+                    [&] {
+                        std::string line;
+                        LaunchSpec s;
+                        for (const std::string& arg : claudeArgs(s, cfg))
+                            line += arg + " ";
+                        return line;
+                    }()
+                        .c_str());
         return kOk;
     }
 
@@ -484,7 +521,7 @@ int main(int argc, char** argv)
                     "tree", v.size(), repos, containers, folders, bare);
         std::printf("%-10s %d probed, %d failed, %d dirty, %.2f s on %d threads\n",
                     "sweep", sink.probed_, sink.failed_, dirty, sink.seconds_,
-                    cfg.scanThreads);
+                    cfg.scanThreads > 0 ? cfg.scanThreads : defaultScanThreads());
         return kOk;
     }
 
@@ -770,9 +807,9 @@ int main(int argc, char** argv)
         }
 
         DispatchOptions opt;
-        opt.allowCommit = cfg.dispatchCommit;
-        opt.allowPush   = cfg.dispatchPush;
-        opt.maxRepos    = cfg.dispatchMaxRepos;
+        opt.autonomy = cfg.autonomy;
+        opt.maxRepos = cfg.dispatchMaxRepos;
+        opt.maxItems = cfg.dispatchMaxItems;
 
         const DispatchPlan plan = buildDispatchPlan(items, opt);
         if (plan.items.empty())

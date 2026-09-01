@@ -11,6 +11,8 @@
 
 #include <thread>
 
+class QCheckBox;
+class QFormLayout;
 class QLabel;
 class QLineEdit;
 class QPushButton;
@@ -81,6 +83,31 @@ private:
     QPushButton*  go_      = nullptr;
 };
 
+// The settings surface, built from core's settings() table so the desktop and
+// console front ends offer the same settings, in the same order, with the same
+// wording. Adding one to that table adds it to both.
+class SettingsDialog : public QDialog {
+    Q_OBJECT
+
+public:
+    SettingsDialog(Config cfg, QWidget* parent = nullptr);
+
+    const Config& config() const { return cfg_; }
+
+private:
+    void addRow(QFormLayout* form, const Setting& s);
+    void refreshDerived();
+
+    Config  cfg_;
+    QLabel* autonomyNote_ = nullptr;
+    QLabel* launchLine_   = nullptr;
+
+    // Held so it can follow the autonomy ladder while it is unpinned. Left
+    // stale it would claim permissions are skipped while the launch line
+    // beneath it shows they are not.
+    QCheckBox* skipPermissions_ = nullptr;
+};
+
 class MainWindow : public QMainWindow {
     Q_OBJECT
 
@@ -101,6 +128,7 @@ private:
     void launch(LaunchMode mode);
     void openTerminal();
     void openDispatch();
+    void openSettings();
     void updateCounts();
 
     Config cfg_;
@@ -126,6 +154,7 @@ private:
     QPushButton* sessions_ = nullptr;
     QPushButton* terminal_ = nullptr;
     QPushButton* dispatch_ = nullptr;
+    QPushButton* settingsBtn_ = nullptr;
 };
 
 } // namespace pm::gui

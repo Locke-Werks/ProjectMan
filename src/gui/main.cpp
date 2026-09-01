@@ -35,8 +35,6 @@ int main(int argc, char** argv)
         cfg.save(nullptr);
     }
 
-    if (cfg.scanThreads <= 0)
-        cfg.scanThreads = pm::defaultScanThreads();
     if (!cfg.gitExe.empty())
         pm::git::setExePathOverride(cfg.gitExe);
 

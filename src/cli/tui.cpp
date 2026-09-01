@@ -1,5 +1,6 @@
 #include "tui.h"
 
+#include "launcher.h"
 #include "strutil.h"
 #include "theme.h"
 
@@ -85,11 +86,11 @@ std::string relTime(std::int64_t unix)
 
 // ------------------------------------------------------------------- state
 
-enum class View { Projects, Dispatch };
+enum class View { Projects, Dispatch, Settings };
 
 struct Ui {
-    ProjectList*  projects = nullptr;
-    const Config* cfg      = nullptr;
+    ProjectList* projects = nullptr;
+    Config*      cfg      = nullptr;
 
     View        view = View::Projects;
     std::string filter;
@@ -102,6 +103,12 @@ struct Ui {
     std::vector<size_t> itemVisible;
     size_t              itemCursor = 0;
     size_t              itemTop    = 0;
+
+    size_t      settingCursor = 0;
+    size_t      settingTop    = 0;
+    bool        editing       = false;
+    std::string editBuffer;
+    bool        settingsDirty = false;
 
     int cols = 100;
     int rows = 30;
@@ -337,8 +344,88 @@ void drawItems(std::string& out, const Ui& u, int listRows)
     }
 }
 
+void drawSettings(std::string& out, const Ui& u, int listRows)
+{
+    const std::vector<Setting>& all = settings();
+
+    out += fg(kFg4);
+    out += "   " + cell("SETTING", 26) + " " + cell("VALUE", 30) + " ";
+    out += "WHAT IT DOES";
+    out += kReset;
+    out += kEol;
+
+    for (int r = 0; r < listRows; ++r) {
+        const size_t i = u.settingTop + static_cast<size_t>(r);
+        if (i >= all.size()) {
+            out += kEol;
+            continue;
+        }
+
+        const Setting& s        = all[i];
+        const bool     selected = (i == u.settingCursor);
+
+        if (selected) {
+            out += fg(kRed);
+            out += "\xe2\x96\x8c";
+            out += bg(kElevated);
+            out += " ";
+        } else {
+            out += "  ";
+        }
+
+        out += fg(selected ? kFg1 : kFg2);
+        out += cell(s.label, 26);
+        out += " ";
+
+        const bool editingThis = selected && u.editing;
+        if (editingThis) {
+            out += fg(kFg1);
+            out += cell(u.editBuffer + "_", 30);
+        } else {
+            // The one setting whose displayed value is not simply its own: it
+            // follows the autonomy ladder until somebody pins it.
+            out += fg(selected ? kRed : kFg3);
+            out += cell(readSetting(*u.cfg, s.key), 30);
+        }
+
+        out += " ";
+        out += fg(kFg4);
+
+        const size_t used = 2 + 26 + 1 + 30 + 1;
+        out += cell(s.help, static_cast<size_t>(
+                                std::max<int>(0, u.cols - static_cast<int>(used))));
+        out += kReset;
+        out += kEol;
+    }
+}
+
 void drawDetail(std::string& out, const Ui& u)
 {
+    if (u.view == View::Settings) {
+        // The autonomy rung governs both the flags a launch carries and what a
+        // dispatch briefing permits, so it is worth spelling out under the list
+        // rather than leaving it to the one-line help column.
+        out += fg(kRed);
+        out += " " + std::string(autonomyLabel(u.cfg->autonomy)) + "  ";
+        out += fg(kFg2);
+        out += autonomySummary(u.cfg->autonomy);
+        out += kReset;
+        out += kEol;
+
+        out += fg(kFg4);
+        out += " claude ";
+        LaunchSpec spec;
+        for (const std::string& a : claudeArgs(spec, *u.cfg))
+            out += a + " ";
+        if (u.settingsDirty) {
+            out += fg(kRed);
+            out += "  UNSAVED";
+        }
+        out += kReset;
+        out += kEol;
+        return;
+    }
+
     if (u.view == View::Dispatch) {
         int sel = 0;
         std::vector<std::string> repos;
@@ -355,8 +442,7 @@ void drawDetail(std::string& out, const Ui& u)
              + " selected across " + std::to_string(repos.size())
              + (repos.size() == 1 ? " repository" : " repositories") + ". ";
         out += fg(kFg4);
-        out += u.cfg->dispatchPush ? "Will commit and push."
-                                   : "Will commit, never push.";
+        out += dispatchSummary(u.cfg->autonomy);
         out += kReset;
         out += kEol;
         out += fg(kFg4);
@@ -409,7 +495,11 @@ void drawFooter(std::string& out, const Ui& u)
         out += fg(kFg4);
         if (u.view == View::Projects) {
             out += " ENTER launch   ^R continue   ^E resume   ^T terminal   "
-                   "^D dispatch   ^Q quit";
+                   "^D dispatch   F2 settings   ^Q quit";
+        } else if (u.view == View::Settings) {
+            out += u.editing
+                     ? " type to edit   ENTER commit   ESC cancel"
+                     : " LEFT/RIGHT change   ENTER edit   ESC back and save   ^Q quit";
         } else {
             out += " SPACE toggle   ^A all   ^N none   ENTER go   ESC back   ^Q quit";
         }
@@ -431,6 +521,8 @@ void render(ConsoleSession& con, Ui& u)
 
     if (u.view == View::Projects)
         clampScroll(u.cursor, u.top, u.visible.size(), listRows);
+    else if (u.view == View::Settings)
+        clampScroll(u.settingCursor, u.settingTop, settings().size(), listRows);
     else
         clampScroll(u.itemCursor, u.itemTop, u.itemVisible.size(), listRows);
 
@@ -448,17 +540,28 @@ void render(ConsoleSession& con, Ui& u)
         header(out, u, "projects",
                std::to_string(u.visible.size()) + " shown  " + std::to_string(dirty)
                    + " dirty  " + std::to_string(open) + " open");
+    } else if (u.view == View::Settings) {
+        header(out, u, "settings", Config::filePath().string());
     } else {
         header(out, u, "dispatch",
                std::to_string(u.itemVisible.size()) + " outstanding");
     }
 
     rule(out, u.cols);
-    drawFilter(out, u);
+    if (u.view == View::Settings) {
+        out += fg(kFg4);
+        out += " Changes are written when you leave this view.";
+        out += kReset;
+        out += kEol;
+    } else {
+        drawFilter(out, u);
+    }
     rule(out, u.cols);
 
     if (u.view == View::Projects)
         drawProjects(out, u, listRows);
+    else if (u.view == View::Settings)
+        drawSettings(out, u, listRows);
     else
         drawItems(out, u, listRows);
 
@@ -480,7 +583,7 @@ bool isCtrl(const KEY_EVENT_RECORD& k)
 
 } // namespace
 
-BrowseResult browse(ConsoleSession& con, ProjectList& projects, const Config& cfg)
+BrowseResult browse(ConsoleSession& con, ProjectList& projects, Config& cfg)
 {
     BrowseResult result;
 
@@ -516,9 +619,47 @@ BrowseResult browse(ConsoleSession& con, ProjectList& projects, const Config& cf
             u.flash.clear();
             dirty = true;
 
-            const bool onItems = (u.view == View::Dispatch);
-            size_t&    cur     = onItems ? u.itemCursor : u.cursor;
-            const size_t count = onItems ? u.itemVisible.size() : u.visible.size();
+            const bool onItems    = (u.view == View::Dispatch);
+            const bool onSettings = (u.view == View::Settings);
+
+            // The settings view owns every keystroke while a text field is
+            // open, including the ones that are shortcuts everywhere else. A
+            // Ctrl+D that fired mid-edit would drop the half-typed value and
+            // jump to dispatch.
+            if (onSettings && u.editing) {
+                if (k.wVirtualKeyCode == VK_RETURN) {
+                    const Setting& s = settings()[u.settingCursor];
+                    std::string    err;
+                    if (applySetting(*u.cfg, s.key, u.editBuffer, &err)) {
+                        u.settingsDirty = true;
+                        u.editing       = false;
+                    } else {
+                        u.flash = err;
+                    }
+                    continue;
+                }
+                if (k.wVirtualKeyCode == VK_ESCAPE) {
+                    u.editing = false;
+                    continue;
+                }
+                if (k.wVirtualKeyCode == VK_BACK) {
+                    if (!u.editBuffer.empty())
+                        u.editBuffer.pop_back();
+                    continue;
+                }
+                if (ch >= 0x20 && ch < 0x7F) {
+                    u.editBuffer.push_back(static_cast<char>(ch));
+                    continue;
+                }
+                continue;
+            }
+
+            size_t& cur = onSettings ? u.settingCursor
+                        : onItems    ? u.itemCursor
+                                     : u.cursor;
+            const size_t count = onSettings ? settings().size()
+                               : onItems    ? u.itemVisible.size()
+                                            : u.visible.size();
 
             // Navigation
             if (k.wVirtualKeyCode == VK_UP) {
@@ -540,6 +681,38 @@ BrowseResult browse(ConsoleSession& con, ProjectList& projects, const Config& cf
             if (k.wVirtualKeyCode == VK_HOME) { cur = 0; continue; }
             if (k.wVirtualKeyCode == VK_END)  { cur = count ? count - 1 : 0; continue; }
 
+            // F2 rather than Ctrl+comma, which is the console front end's one
+            // unavoidable divergence from the desktop one: Windows Terminal
+            // binds Ctrl+comma to its own settings and swallows it before the
+            // application sees a key event at all. Function keys pass through.
+            if (k.wVirtualKeyCode == VK_F2) {
+                if (u.view == View::Projects) {
+                    u.settingCursor = 0;
+                    u.settingTop    = 0;
+                    u.editing       = false;
+                    u.settingsDirty = false;
+                    u.view          = View::Settings;
+                }
+                continue;
+            }
+
+            if (onSettings
+                && (k.wVirtualKeyCode == VK_LEFT || k.wVirtualKeyCode == VK_RIGHT)) {
+                const Setting& s = settings()[u.settingCursor];
+                const int dir = k.wVirtualKeyCode == VK_RIGHT ? 1 : -1;
+                const std::string next = cycleSetting(*u.cfg, s.key, dir);
+                // Text and path settings have nothing to cycle through; Enter
+                // opens them instead.
+                if (!next.empty() || s.kind == SettingKind::Choice) {
+                    std::string err;
+                    if (applySetting(*u.cfg, s.key, next, &err))
+                        u.settingsDirty = true;
+                    else
+                        u.flash = err;
+                }
+                continue;
+            }
+
             // Every action is Ctrl-modified or a named key, because a bare
             // letter has to remain available for the filter.
             if (isCtrl(k)) {
@@ -547,8 +720,17 @@ BrowseResult browse(ConsoleSession& con, ProjectList& projects, const Config& cf
                 case 'Q':
                     result.action = Action::Quit;
                     return result;
+                case VK_OEM_COMMA:
+                    if (u.view == View::Projects) {
+                        u.settingCursor = 0;
+                        u.settingTop    = 0;
+                        u.editing       = false;
+                        u.settingsDirty = false;
+                        u.view          = View::Settings;
+                    }
+                    continue;
                 case 'D':
-                    if (!onItems) {
+                    if (!onItems && !onSettings) {
                         u.items = collectWorkItems(projects);
                         preselect(u.items, cfg.dispatchMaxRepos);
                         u.filter.clear();
@@ -571,21 +753,21 @@ BrowseResult browse(ConsoleSession& con, ProjectList& projects, const Config& cf
                     }
                     continue;
                 case 'R':
-                    if (!onItems && !u.visible.empty()) {
+                    if (!onItems && !onSettings && !u.visible.empty()) {
                         result.action  = Action::LaunchContinue;
                         result.project = &projects[u.visible[u.cursor]];
                         return result;
                     }
                     continue;
                 case 'E':
-                    if (!onItems && !u.visible.empty()) {
+                    if (!onItems && !onSettings && !u.visible.empty()) {
                         result.action  = Action::LaunchResume;
                         result.project = &projects[u.visible[u.cursor]];
                         return result;
                     }
                     continue;
                 case 'T':
-                    if (!onItems && !u.visible.empty()) {
+                    if (!onItems && !onSettings && !u.visible.empty()) {
                         result.action  = Action::OpenTerminal;
                         result.project = &projects[u.visible[u.cursor]];
                         return result;
@@ -597,7 +779,21 @@ BrowseResult browse(ConsoleSession& con, ProjectList& projects, const Config& cf
             }
 
             if (k.wVirtualKeyCode == VK_ESCAPE) {
-                if (onItems) {
+                if (onSettings) {
+                    // Written on the way out rather than on every keystroke, so
+                    // a half-finished pass through the list is one file write
+                    // instead of twenty.
+                    if (u.settingsDirty) {
+                        std::string err;
+                        if (!u.cfg->save(&err)) {
+                            u.flash = err;
+                            continue;
+                        }
+                        u.settingsDirty = false;
+                    }
+                    u.view = View::Projects;
+                    refilter(u);
+                } else if (onItems) {
                     u.view = View::Projects;
                     u.filter.clear();
                     refilter(u);
@@ -612,11 +808,29 @@ BrowseResult browse(ConsoleSession& con, ProjectList& projects, const Config& cf
             }
 
             if (k.wVirtualKeyCode == VK_RETURN) {
+                if (onSettings) {
+                    const Setting& st = settings()[u.settingCursor];
+                    if (st.kind == SettingKind::Text || st.kind == SettingKind::Path
+                        || st.kind == SettingKind::StringList) {
+                        u.editBuffer = readSetting(*u.cfg, st.key);
+                        u.editing    = true;
+                    } else {
+                        // Choice, Bool and Int have nothing to type, so Enter
+                        // means the same as Right.
+                        const std::string next = cycleSetting(*u.cfg, st.key, 1);
+                        std::string       err;
+                        if (applySetting(*u.cfg, st.key, next, &err))
+                            u.settingsDirty = true;
+                        else
+                            u.flash = err;
+                    }
+                    continue;
+                }
                 if (onItems) {
                     DispatchOptions opt;
-                    opt.allowCommit = cfg.dispatchCommit;
-                    opt.allowPush   = cfg.dispatchPush;
-                    opt.maxRepos    = cfg.dispatchMaxRepos;
+                    opt.autonomy = cfg.autonomy;
+                    opt.maxRepos = cfg.dispatchMaxRepos;
+                    opt.maxItems = cfg.dispatchMaxItems;
 
                     result.plan = buildDispatchPlan(u.items, opt);
                     if (result.plan.items.empty()) {
@@ -642,7 +856,7 @@ BrowseResult browse(ConsoleSession& con, ProjectList& projects, const Config& cf
                 continue;
             }
 
-            if (k.wVirtualKeyCode == VK_BACK) {
+            if (k.wVirtualKeyCode == VK_BACK && !onSettings) {
                 if (!u.filter.empty()) {
                     u.filter.pop_back();
                     onItems ? refilterItems(u) : refilter(u);
@@ -650,7 +864,7 @@ BrowseResult browse(ConsoleSession& con, ProjectList& projects, const Config& cf
                 continue;
             }
 
-            if (ch >= 0x20 && ch < 0x7F) {
+            if (ch >= 0x20 && ch < 0x7F && !onSettings) {
                 u.filter.push_back(static_cast<char>(ch));
                 onItems ? refilterItems(u) : refilter(u);
                 continue;

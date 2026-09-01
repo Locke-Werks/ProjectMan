@@ -43,7 +43,20 @@ bool childLive() { return g_childLive.load(std::memory_order_acquire); }
 
 std::vector<std::string> claudeArgs(const LaunchSpec& s, const Config& cfg)
 {
-    std::vector<std::string> args = cfg.claudeArgs;
+    std::vector<std::string> args;
+
+    // Composed from the settings rather than stored as a literal command line,
+    // so the autonomy ladder actually reaches the session. At Suggest, skipping
+    // permission checks would contradict the whole rung.
+    if (cfg.resolvedSkipPermissions())
+        args.emplace_back("--dangerously-skip-permissions");
+
+    if (!cfg.effort.empty()) {
+        args.emplace_back("--effort");
+        args.push_back(cfg.effort);
+    }
+
+    args.insert(args.end(), cfg.extraArgs.begin(), cfg.extraArgs.end());
 
     switch (s.mode) {
     case LaunchMode::Continue:

@@ -10,7 +10,9 @@
 
 #include <QApplication>
 #include <QCheckBox>
+#include <QComboBox>
 #include <QDialogButtonBox>
+#include <QFormLayout>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QLabel>
@@ -18,7 +20,9 @@
 #include <QMessageBox>
 #include <QPushButton>
 #include <QResizeEvent>
+#include <QScrollArea>
 #include <QShortcut>
+#include <QSpinBox>
 #include <QSplitter>
 #include <QTableView>
 #include <QTableWidget>
@@ -227,9 +231,9 @@ DispatchDialog::DispatchDialog(WorkList items, const Config& cfg, QWidget* paren
 void DispatchDialog::rebuildSummary()
 {
     DispatchOptions opt;
-    opt.allowCommit = cfg_.dispatchCommit;
-    opt.allowPush   = cfg_.dispatchPush;
-    opt.maxRepos    = cfg_.dispatchMaxRepos;
+    opt.autonomy = cfg_.autonomy;
+    opt.maxRepos = cfg_.dispatchMaxRepos;
+    opt.maxItems = cfg_.dispatchMaxItems;
 
     const DispatchPlan preview = buildDispatchPlan(items_, opt);
     const int          n       = static_cast<int>(preview.items.size());
@@ -242,22 +246,194 @@ void DispatchDialog::rebuildSummary()
                      .arg(n == 1 ? "" : "s")
                      .arg(repos)
                      .arg(repos == 1 ? "y" : "ies")
-                     .arg(cfg_.dispatchPush ? QStringLiteral("Will commit and push.")
-                                            : QStringLiteral("Will commit, never push.")));
+                     .arg(QString::fromStdString(dispatchSummary(cfg_.autonomy))));
     go_->setEnabled(n > 0);
 }
 
 void DispatchDialog::accept()
 {
     DispatchOptions opt;
-    opt.allowCommit = cfg_.dispatchCommit;
-    opt.allowPush   = cfg_.dispatchPush;
-    opt.maxRepos    = cfg_.dispatchMaxRepos;
+    opt.autonomy = cfg_.autonomy;
+    opt.maxRepos = cfg_.dispatchMaxRepos;
+    opt.maxItems = cfg_.dispatchMaxItems;
 
     plan_ = buildDispatchPlan(items_, opt);
     if (plan_.items.empty())
         return;
     QDialog::accept();
+}
+
+// ------------------------------------------------------------- SettingsDialog
+
+SettingsDialog::SettingsDialog(Config cfg, QWidget* parent)
+    : QDialog(parent), cfg_(std::move(cfg))
+{
+    setWindowTitle(QStringLiteral("Settings"));
+    resize(760, 720);
+
+    auto* root = new QVBoxLayout(this);
+    root->setContentsMargins(18, 14, 18, 16);
+    root->setSpacing(12);
+
+    root->addWidget(new TrackedLabel(QStringLiteral("// Settings"), 15, QFont::Bold, 0.18));
+
+    auto* where = caption(QString::fromStdString(Config::filePath().string()), kFg4, 11);
+    where->setFont(theme::mono(11));
+    root->addWidget(where);
+
+    auto* scroll = new QScrollArea;
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+
+    auto* page = new QWidget;
+    auto* form = new QFormLayout(page);
+    form->setContentsMargins(0, 8, 8, 8);
+    form->setSpacing(10);
+    form->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
+
+    for (const Setting& s : settings())
+        addRow(form, s);
+
+    scroll->setWidget(page);
+    root->addWidget(scroll, 1);
+
+    autonomyNote_ = caption(QString(), kFg2);
+    autonomyNote_->setWordWrap(true);
+    root->addWidget(autonomyNote_);
+
+    launchLine_ = caption(QString(), kFg4, 11);
+    launchLine_->setFont(theme::mono(11));
+    launchLine_->setWordWrap(true);
+    root->addWidget(launchLine_);
+
+    auto* buttons = new QHBoxLayout;
+    buttons->addStretch(1);
+    auto* cancel = new QPushButton(QStringLiteral("CANCEL"));
+    auto* save   = new QPushButton(QStringLiteral("SAVE"));
+    save->setObjectName(QStringLiteral("Primary"));
+    for (QPushButton* b : { cancel, save })
+        b->setFont(theme::tracked(11, QFont::Bold, 0.14));
+    buttons->addWidget(cancel);
+    buttons->addWidget(save);
+    root->addLayout(buttons);
+
+    connect(cancel, &QPushButton::clicked, this, &QDialog::reject);
+    connect(save, &QPushButton::clicked, this, [this] {
+        std::string err;
+        if (!cfg_.save(&err)) {
+            QMessageBox::warning(this, QStringLiteral("ProjectMan"),
+                                 QString::fromStdString(err));
+            return;
+        }
+        accept();
+    });
+
+    refreshDerived();
+}
+
+void SettingsDialog::refreshDerived()
+{
+    autonomyNote_->setText(QStringLiteral("%1  %2")
+                               .arg(QString::fromLatin1(autonomyLabel(cfg_.autonomy)))
+                               .arg(QString::fromLatin1(autonomySummary(cfg_.autonomy))));
+    autonomyNote_->setStyleSheet(
+        QStringLiteral("color: %1;").arg(theme::c(kFg2).name()));
+
+    // While unpinned this follows the ladder, so it has to be re-read rather
+    // than left at whatever it was when the dialog opened.
+    if (skipPermissions_ && !cfg_.skipPermissionsExplicit) {
+        QSignalBlocker block(skipPermissions_);
+        skipPermissions_->setChecked(cfg_.resolvedSkipPermissions());
+    }
+
+    LaunchSpec  spec;
+    QStringList args;
+    for (const std::string& a : claudeArgs(spec, cfg_))
+        args << QString::fromStdString(a);
+    launchLine_->setText(QStringLiteral("claude ") + args.join(QLatin1Char(' ')));
+}
+
+void SettingsDialog::addRow(QFormLayout* form, const Setting& s)
+{
+    const QString current = QString::fromStdString(readSetting(cfg_, s.key));
+    const QString key     = QString::fromLatin1(s.key);
+
+    auto* label = new TrackedLabel(QString::fromLatin1(s.label), 11, QFont::DemiBold, 0.1);
+    label->setToolTip(QString::fromLatin1(s.help));
+
+    QWidget* editor = nullptr;
+
+    const auto apply = [this, key](const QString& value) {
+        std::string err;
+        if (!applySetting(cfg_, key.toStdString(), value.toStdString(), &err)) {
+            QMessageBox::warning(this, QStringLiteral("ProjectMan"),
+                                 QString::fromStdString(err));
+            return;
+        }
+        refreshDerived();
+    };
+
+    switch (s.kind) {
+    case SettingKind::Bool: {
+        auto* box = new QCheckBox;
+        // launch.skip_permissions reads back as "true (from autonomy)" when it
+        // is unpinned, so the checkbox reflects the first word only.
+        box->setChecked(current.startsWith(QStringLiteral("true")));
+        connect(box, &QCheckBox::toggled, this, [apply](bool on) {
+            apply(on ? QStringLiteral("true") : QStringLiteral("false"));
+        });
+        if (key == QLatin1String("launch.skip_permissions")) {
+            skipPermissions_ = box;
+            box->setToolTip(QStringLiteral(
+                "Follows the autonomy ladder until you change it here."));
+        }
+        editor = box;
+        break;
+    }
+
+    case SettingKind::Int: {
+        auto* spin = new QSpinBox;
+        spin->setRange(s.min, s.max);
+        spin->setValue(current.toInt());
+        connect(spin, &QSpinBox::valueChanged, this,
+                [apply](int v) { apply(QString::number(v)); });
+        editor = spin;
+        break;
+    }
+
+    case SettingKind::Choice: {
+        auto* combo = new QComboBox;
+        for (const QString& opt :
+             QString::fromLatin1(s.choices).split(QLatin1Char(','))) {
+            combo->addItem(opt.isEmpty() ? QStringLiteral("(default)") : opt, opt);
+        }
+        const int idx = combo->findData(current);
+        combo->setCurrentIndex(idx >= 0 ? idx : 0);
+        connect(combo, &QComboBox::currentIndexChanged, this, [apply, combo](int i) {
+            apply(combo->itemData(i).toString());
+        });
+        editor = combo;
+        break;
+    }
+
+    case SettingKind::Text:
+    case SettingKind::Path:
+    case SettingKind::StringList: {
+        auto* edit = new QLineEdit(current);
+        edit->setObjectName(QStringLiteral("Filter"));   // reuse the field styling
+        if (s.kind == SettingKind::StringList)
+            edit->setPlaceholderText(QStringLiteral("comma separated"));
+        // Committed on edit rather than per keystroke, so a half-typed path is
+        // never validated and rejected mid-word.
+        connect(edit, &QLineEdit::editingFinished, this,
+                [apply, edit] { apply(edit->text()); });
+        editor = edit;
+        break;
+    }
+    }
+
+    if (editor)
+        form->addRow(label, editor);
 }
 
 // ----------------------------------------------------------------- MainWindow
@@ -353,14 +529,16 @@ MainWindow::MainWindow(Config cfg, QWidget* parent)
 
     dl->addStretch(1);
 
-    engage_   = new QPushButton(QStringLiteral("ENGAGE"));
+    engage_      = new QPushButton(QStringLiteral("ENGAGE"));
+    settingsBtn_ = new QPushButton(QStringLiteral("SETTINGS"));
     resume_   = new QPushButton(QStringLiteral("CONTINUE"));
     sessions_ = new QPushButton(QStringLiteral("SESSIONS"));
     terminal_ = new QPushButton(QStringLiteral("TERMINAL"));
     dispatch_ = new QPushButton(QStringLiteral("DISPATCH"));
     engage_->setObjectName(QStringLiteral("Primary"));
 
-    for (QPushButton* b : { engage_, resume_, sessions_, terminal_, dispatch_ })
+    for (QPushButton* b : { engage_, resume_, sessions_, terminal_, dispatch_,
+                            settingsBtn_ })
         b->setFont(theme::tracked(11, QFont::Bold, 0.14));
 
     dl->addWidget(engage_);
@@ -372,6 +550,7 @@ MainWindow::MainWindow(Config cfg, QWidget* parent)
     row3->addWidget(terminal_);
     row3->addWidget(dispatch_);
     dl->addLayout(row3);
+    dl->addWidget(settingsBtn_);
 
     split->addWidget(detail);
     split->setStretchFactor(0, 3);
@@ -400,6 +579,7 @@ MainWindow::MainWindow(Config cfg, QWidget* parent)
     connect(sessions_, &QPushButton::clicked, this, [this] { launch(LaunchMode::Resume); });
     connect(terminal_, &QPushButton::clicked, this, &MainWindow::openTerminal);
     connect(dispatch_, &QPushButton::clicked, this, &MainWindow::openDispatch);
+    connect(settingsBtn_, &QPushButton::clicked, this, &MainWindow::openSettings);
 
     // The same bindings as the console front end, so muscle memory carries
     // between the two. Ctrl-modified throughout, because the filter box owns
@@ -416,6 +596,8 @@ MainWindow::MainWindow(Config cfg, QWidget* parent)
                   [this] { launch(LaunchMode::Resume); });
     new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_T), this,
                   [this] { openTerminal(); });
+    new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_Comma), this,
+                  [this] { openSettings(); });
 
     onSelectionChanged();
     scan_->start(cfg_);
@@ -579,6 +761,29 @@ void MainWindow::openDispatch()
     std::string err;
     if (!openInTerminal(s, cfg_, &err))
         QMessageBox::warning(this, QStringLiteral("ProjectMan"), QString::fromStdString(err));
+}
+
+void MainWindow::openSettings()
+{
+    SettingsDialog dlg(cfg_, this);
+    if (dlg.exec() != QDialog::Accepted)
+        return;
+
+    const Config before = cfg_;
+    cfg_ = dlg.config();
+
+    // Only a change that alters what gets indexed is worth a sweep. Autonomy
+    // and the launch flags take effect on the next launch by themselves.
+    const bool rescanNeeded = before.root != cfg_.root
+                           || before.exclude != cfg_.exclude
+                           || before.includePlain != cfg_.includePlain
+                           || before.descendContainers != cfg_.descendContainers
+                           || before.githubEnabled != cfg_.githubEnabled
+                           || before.githubOwners != cfg_.githubOwners;
+    if (rescanNeeded)
+        rescan();
+    else
+        onSelectionChanged();
 }
 
 void MainWindow::rescan()

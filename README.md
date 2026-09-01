@@ -51,7 +51,7 @@ pm items [--json]           every outstanding item across the tree
 pm dispatch [--all] [--dry-run]
 pm refresh                  refetch open pull requests and issues
 pm doctor                   resolve git, claude and wt, and time a sweep
-pm config [--path|--init]
+pm config [show|get <key>|set <key> <value>] [--path|--init]
 ```
 
 `<name>` matches on exact name, then unique prefix, then unique substring. A
@@ -74,6 +74,7 @@ Every action is Ctrl-modified, because bare letters go to the filter.
 | Ctrl+E | pick a session to resume |
 | Ctrl+T | open a terminal window |
 | Ctrl+D | dispatch |
+| F2 | settings (Ctrl+, in the desktop app) |
 | F5 | rescan |
 | Ctrl+Q | quit |
 
@@ -86,25 +87,55 @@ In the dispatch view: Space toggles, Ctrl+A all, Ctrl+N none, Enter go, Esc back
 - Unchecked `- [ ]` boxes in markdown
 - The title and last prompt of an unfinished Claude Code session
 
-## Configuration
+## Settings
+
+Both front ends read and write the same file, from one shared description of
+the editable surface, so adding a setting adds it to both.
+
+- Console: `F2` opens the settings view. Left and right change a value, Enter
+  edits a text field, Escape saves and returns. It is `F2` rather than `Ctrl+,`
+  because Windows Terminal binds that to its own settings and the key never
+  reaches the application.
+- Desktop: `Ctrl+,` or the SETTINGS button.
+- Shell: `pm config`, `pm config get <key>`, `pm config set <key> <value>`.
+
+### Autonomy
+
+One ladder governs how far Claude Code may go on its own. Each rung contains
+the ones below it, and it drives both the flags a session launches with and
+what a dispatch briefing permits, so the two can never contradict each other.
+
+| Rung | |
+|---|---|
+| `suggest` | Read and report. Changes nothing, and asks before every tool. |
+| `write` | Edit the working tree. Every change stays visible in `git diff`. |
+| `commit` | Edit and commit. Nothing leaves the machine; `git reset` undoes it. |
+| `push` | Commit and push a branch. Work leaves the machine. |
+| `full` | Push and open pull requests. Reviewable, but public. |
+
+`commit` is the default. At `suggest`, `--dangerously-skip-permissions` is not
+passed, because asking before every edit is the whole of that rung.
+
+### The file
 
 `%LOCALAPPDATA%\ProjectMan\projectman.toml`, written on first run. A copy beside
 the executable takes precedence, so a portable checkout can carry its own.
 
 Unknown keys are rejected rather than ignored, and a file that fails to parse is
-reported and left alone rather than overwritten.
+reported with its line number and left alone rather than overwritten.
 
 ```toml
-root = 'C:\Users\you\projects'
+root     = 'C:\Users\you\projects'
+autonomy = "commit"
 
 [launch]
 claude = 'C:\Users\you\.local\bin\claude.exe'
-args   = ["--dangerously-skip-permissions", "--effort", "max"]
+effort = "max"
+# skip_permissions follows the autonomy ladder until you set it here.
 
 [dispatch]
-commit    = true
-push      = false
 max_repos = 8
+max_items = 40
 ```
 
 `scan.threads = 0` picks three quarters of the logical CPUs.

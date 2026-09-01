@@ -7,6 +7,8 @@
 
 #include <toml++/toml.hpp>
 
+#include <algorithm>
+#include <cstring>
 #include <fstream>
 #include <set>
 #include <sstream>
@@ -30,7 +32,7 @@ fs::path knownFolder(REFKNOWNFOLDERID id)
 
 fs::path exeDir()
 {
-    wchar_t buf[MAX_PATH * 2] = {};
+    wchar_t     buf[MAX_PATH * 2] = {};
     const DWORD n = GetModuleFileNameW(nullptr, buf, static_cast<DWORD>(std::size(buf)));
     if (n == 0 || n >= std::size(buf))
         return {};
@@ -42,12 +44,20 @@ constexpr const char* kFileName = "projectman.toml";
 // Every key the parser recognises. A key outside this set is a typo, and a typo
 // that is silently ignored means the program quietly does something other than
 // what was written down.
+//
+// launch.args is still here on purpose. It was the whole launch surface before
+// the autonomy ladder existed, and a config written by an earlier build must
+// keep loading rather than being rejected as unknown. See migrateLaunchArgs.
 const std::set<std::string> kKnownKeys = {
     "root",
+    "autonomy",
     "git_exe",
     "launch.claude",
-    "launch.args",
     "launch.model",
+    "launch.effort",
+    "launch.skip_permissions",
+    "launch.extra_args",
+    "launch.args",
     "launch.terminal",
     "launch.terminal_args",
     "scan.threads",
@@ -58,9 +68,12 @@ const std::set<std::string> kKnownKeys = {
     "github.enabled",
     "github.owners",
     "github.cache_minutes",
+    "dispatch.max_repos",
+    "dispatch.max_items",
+    // Superseded by the autonomy ladder. Still recognised so a config written
+    // by an earlier build loads rather than being rejected as a typo.
     "dispatch.commit",
     "dispatch.push",
-    "dispatch.max_repos",
     "ui.sort",
     "ui.on_exit",
 };
@@ -78,9 +91,8 @@ void collectKeys(const toml::table& tbl, const std::string& prefix,
     }
 }
 
-// Templated on the view type: a non-const toml::table yields
-// node_view<node>, a const one yields node_view<const node>, and both need to
-// work here.
+// Templated on the view type: a non-const toml::table yields node_view<node>,
+// a const one yields node_view<const node>, and both need to work here.
 template <typename View>
 std::vector<std::string> stringArray(const View& n)
 {
@@ -94,7 +106,135 @@ std::vector<std::string> stringArray(const View& n)
     return out;
 }
 
+// An older config carried the whole launch line in launch.args. Pull the flags
+// the settings surface now owns out of it and leave the rest as extras, so an
+// upgrade neither loses a setting nor passes --effort twice.
+void migrateLaunchArgs(Config& cfg, const std::vector<std::string>& args)
+{
+    cfg.extraArgs.clear();
+
+    for (size_t i = 0; i < args.size(); ++i) {
+        const std::string& a = args[i];
+
+        if (a == "--dangerously-skip-permissions") {
+            // Deliberately not marked explicit. Every config written before the
+            // ladder existed carried this flag, so pinning it here would leave
+            // the autonomy setting unable to take it away again: dropping to
+            // suggest would still hand the session a blanket permission bypass.
+            // The ladder produces the same flag at commit and above anyway, so
+            // letting it govern preserves the old behaviour and restores the
+            // lower rungs.
+            cfg.skipPermissions = true;
+            continue;
+        }
+        if (a == "--effort" && i + 1 < args.size()) {
+            cfg.effort = args[++i];
+            continue;
+        }
+        if (a == "--model" && i + 1 < args.size()) {
+            cfg.model = args[++i];
+            continue;
+        }
+        cfg.extraArgs.push_back(a);
+    }
+}
+
+std::string joinList(const std::vector<std::string>& v)
+{
+    std::string out;
+    for (size_t i = 0; i < v.size(); ++i)
+        out += (i ? ", " : "") + v[i];
+    return out;
+}
+
+std::vector<std::string> splitList(std::string_view s)
+{
+    std::vector<std::string> out;
+    size_t                   start = 0;
+    while (start <= s.size()) {
+        const size_t comma = s.find(',', start);
+        const size_t end   = comma == std::string_view::npos ? s.size() : comma;
+        const std::string_view piece = trim(s.substr(start, end - start));
+        if (!piece.empty())
+            out.emplace_back(piece);
+        if (comma == std::string_view::npos)
+            break;
+        start = comma + 1;
+    }
+    return out;
+}
+
+bool parseBool(std::string_view s, bool* out)
+{
+    if (iequals(s, "true") || iequals(s, "on") || iequals(s, "yes") || s == "1") {
+        *out = true;
+        return true;
+    }
+    if (iequals(s, "false") || iequals(s, "off") || iequals(s, "no") || s == "0") {
+        *out = false;
+        return true;
+    }
+    return false;
+}
+
 } // namespace
+
+// ------------------------------------------------------------------ autonomy
+
+const char* autonomyName(Autonomy a)
+{
+    switch (a) {
+    case Autonomy::Suggest: return "suggest";
+    case Autonomy::Write:   return "write";
+    case Autonomy::Commit:  return "commit";
+    case Autonomy::Push:    return "push";
+    case Autonomy::Full:    return "full";
+    }
+    return "commit";
+}
+
+const char* autonomyLabel(Autonomy a)
+{
+    switch (a) {
+    case Autonomy::Suggest: return "SUGGEST";
+    case Autonomy::Write:   return "WRITE";
+    case Autonomy::Commit:  return "COMMIT";
+    case Autonomy::Push:    return "PUSH";
+    case Autonomy::Full:    return "FULL";
+    }
+    return "COMMIT";
+}
+
+const char* autonomySummary(Autonomy a)
+{
+    switch (a) {
+    case Autonomy::Suggest:
+        return "Read and report. Changes nothing, and asks before every tool.";
+    case Autonomy::Write:
+        return "Edit the working tree. Every change stays visible in git diff.";
+    case Autonomy::Commit:
+        return "Edit and commit. Nothing leaves the machine; git reset undoes it.";
+    case Autonomy::Push:
+        return "Commit and push a branch. Work leaves the machine.";
+    case Autonomy::Full:
+        return "Push and open pull requests. Reviewable, but public.";
+    }
+    return "";
+}
+
+Autonomy autonomyFromString(std::string_view s, bool* ok)
+{
+    if (ok)
+        *ok = true;
+    if (iequals(s, "suggest")) return Autonomy::Suggest;
+    if (iequals(s, "write"))   return Autonomy::Write;
+    if (iequals(s, "commit"))  return Autonomy::Commit;
+    if (iequals(s, "push"))    return Autonomy::Push;
+    if (iequals(s, "full"))    return Autonomy::Full;
+    if (ok)
+        *ok = false;
+    return Autonomy::Commit;
+}
 
 std::string toString(OnChildExit e)
 {
@@ -110,16 +250,15 @@ OnChildExit onChildExitFromString(std::string_view s, bool* ok)
 {
     if (ok)
         *ok = true;
-    if (iequals(s, "quit"))
-        return OnChildExit::Quit;
-    if (iequals(s, "ask"))
-        return OnChildExit::Ask;
-    if (iequals(s, "return"))
-        return OnChildExit::Return;
+    if (iequals(s, "quit"))   return OnChildExit::Quit;
+    if (iequals(s, "ask"))    return OnChildExit::Ask;
+    if (iequals(s, "return")) return OnChildExit::Return;
     if (ok)
         *ok = false;
     return OnChildExit::Return;
 }
+
+// -------------------------------------------------------------------- config
 
 Config Config::defaults()
 {
@@ -129,8 +268,8 @@ Config Config::defaults()
     c.root      = profile / "projects";
     c.claudeExe = profile / ".local" / "bin" / "claude.exe";
 
-    // The two flags the user runs Claude Code with everywhere else.
-    c.claudeArgs = { "--dangerously-skip-permissions", "--effort", "max" };
+    c.autonomy = Autonomy::Commit;
+    c.effort   = "max";
 
     c.githubOwners = { "lockewerks", "Locke-Werks", "nyxlocke", "jhancuff" };
 
@@ -204,7 +343,7 @@ Config Config::load(ConfigStatus* status, std::string* detail)
 {
     Config c = defaults();
 
-    const fs::path path = filePath();
+    const fs::path  path = filePath();
     std::error_code ec;
     if (path.empty() || !fs::exists(path, ec)) {
         if (status)
@@ -244,15 +383,54 @@ Config Config::load(ConfigStatus* status, std::string* detail)
         return b ? tbl[a][b].value<std::string>() : tbl[a].value<std::string>();
     };
 
-    if (const auto v = str("root"))            c.root      = fs::path(widen(*v));
-    if (const auto v = str("git_exe"))         c.gitExe    = fs::path(widen(*v));
-    if (const auto v = str("launch", "claude"))   c.claudeExe   = fs::path(widen(*v));
-    if (const auto v = str("launch", "model"))    c.model       = *v;
-    if (const auto v = str("launch", "terminal")) c.terminalExe = fs::path(widen(*v));
+    const auto bad = [&](const std::string& msg) {
+        if (status)
+            *status = ConfigStatus::Unreadable;
+        if (detail)
+            *detail = path.string() + ": " + msg;
+        return Config::defaults();
+    };
+
+    if (const auto v = str("root"))    c.root   = fs::path(widen(*v));
+    if (const auto v = str("git_exe")) c.gitExe = fs::path(widen(*v));
+
+    if (const auto v = str("autonomy")) {
+        bool ok = false;
+        c.autonomy = autonomyFromString(*v, &ok);
+        if (!ok)
+            return bad("autonomy must be suggest, write, commit, push or full");
+    }
+
+    if (const auto v = str("launch", "claude"))        c.claudeExe    = fs::path(widen(*v));
+    if (const auto v = str("launch", "model"))         c.model        = *v;
+    if (const auto v = str("launch", "effort"))        c.effort       = *v;
+    if (const auto v = str("launch", "terminal"))      c.terminalExe  = fs::path(widen(*v));
     if (const auto v = str("launch", "terminal_args")) c.terminalArgs = *v;
 
-    if (tbl["launch"]["args"].is_array())
-        c.claudeArgs = stringArray(tbl["launch"]["args"]);
+    if (tbl["launch"]["skip_permissions"].is_boolean()) {
+        c.skipPermissions         = tbl["launch"]["skip_permissions"].value_or(true);
+        c.skipPermissionsExplicit = true;
+    }
+
+    if (tbl["launch"]["extra_args"].is_array())
+        c.extraArgs = stringArray(tbl["launch"]["extra_args"]);
+
+    // Read after the structured keys, so an explicitly set launch.effort is not
+    // clobbered by a stale launch.args carrying the same flag.
+    if (tbl["launch"]["args"].is_array()) {
+        Config migrated = c;
+        migrateLaunchArgs(migrated, stringArray(tbl["launch"]["args"]));
+        if (!str("launch", "effort"))
+            c.effort = migrated.effort;
+        if (!str("launch", "model"))
+            c.model = migrated.model;
+        if (!tbl["launch"]["skip_permissions"].is_boolean()) {
+            c.skipPermissions         = migrated.skipPermissions;
+            c.skipPermissionsExplicit = migrated.skipPermissionsExplicit;
+        }
+        if (!tbl["launch"]["extra_args"].is_array())
+            c.extraArgs = migrated.extraArgs;
+    }
 
     c.scanThreads       = tbl["scan"]["threads"].value_or(c.scanThreads);
     c.probeTimeoutMs    = tbl["scan"]["timeout_ms"].value_or(c.probeTimeoutMs);
@@ -266,22 +444,30 @@ Config Config::load(ConfigStatus* status, std::string* detail)
     if (tbl["github"]["owners"].is_array())
         c.githubOwners = stringArray(tbl["github"]["owners"]);
 
-    c.dispatchCommit   = tbl["dispatch"]["commit"].value_or(c.dispatchCommit);
-    c.dispatchPush     = tbl["dispatch"]["push"].value_or(c.dispatchPush);
     c.dispatchMaxRepos = tbl["dispatch"]["max_repos"].value_or(c.dispatchMaxRepos);
+    c.dispatchMaxItems = tbl["dispatch"]["max_items"].value_or(c.dispatchMaxItems);
 
-    if (const auto v = str("ui", "sort"))
-        c.sort = *v;
+    // The two booleans the ladder replaced. An explicit autonomy wins, so this
+    // only fires for a config written before the ladder existed.
+    if (!str("autonomy")
+        && (tbl["dispatch"]["commit"].is_boolean() || tbl["dispatch"]["push"].is_boolean())) {
+        const bool commit = tbl["dispatch"]["commit"].value_or(true);
+        const bool push   = tbl["dispatch"]["push"].value_or(false);
+        c.autonomy = push ? Autonomy::Push : (commit ? Autonomy::Commit : Autonomy::Write);
+    }
+
+    if (const auto v = str("ui", "sort")) {
+        if (!iequals(*v, "recent") && !iequals(*v, "name") && !iequals(*v, "dirty")
+            && !iequals(*v, "open")) {
+            return bad("ui.sort must be recent, name, dirty or open");
+        }
+        c.sort = toLower(*v);
+    }
     if (const auto v = str("ui", "on_exit")) {
         bool ok = false;
         c.onExit = onChildExitFromString(*v, &ok);
-        if (!ok) {
-            if (status)
-                *status = ConfigStatus::Unreadable;
-            if (detail)
-                *detail = path.string() + ": ui.on_exit must be return, quit or ask";
-            return Config::defaults();
-        }
+        if (!ok)
+            return bad("ui.on_exit must be return, quit or ask");
     }
 
     if (status)
@@ -291,14 +477,17 @@ Config Config::load(ConfigStatus* status, std::string* detail)
 
 bool Config::save(std::string* error) const
 {
-    const fs::path path = perUserPath();
+    fs::path path = portablePath();
+    std::error_code ec;
+    if (path.empty() || !fs::exists(path, ec))
+        path = perUserPath();
+
     if (path.empty()) {
         if (error)
             *error = "cannot resolve %LOCALAPPDATA%";
         return false;
     }
 
-    std::error_code ec;
     fs::create_directories(path.parent_path(), ec);
 
     // TOML literal strings for every path. In a basic string "{InstallDir}\bin"
@@ -306,21 +495,40 @@ bool Config::save(std::string* error) const
     // documents for installer.toml.
     std::ostringstream os;
     os << "# ProjectMan configuration.\n"
-       << "# A copy of this file beside projectman.exe takes precedence over this one.\n"
-       << "# Unknown keys are rejected rather than ignored.\n\n";
+       << "# A copy of this file beside the executable takes precedence over this one.\n"
+       << "# Unknown keys are rejected rather than ignored.\n"
+       << "#\n"
+       << "# Edit here, or with `pm config set <key> <value>`, or in either app.\n\n";
 
     os << "root = '" << root.string() << "'\n\n";
 
+    os << "# How far Claude Code may go on its own. Each rung contains the ones\n"
+       << "# below it.\n";
+    for (const Autonomy a : { Autonomy::Suggest, Autonomy::Write, Autonomy::Commit,
+                              Autonomy::Push, Autonomy::Full }) {
+        os << "#   " << autonomyName(a);
+        os << std::string(std::max<size_t>(1, 9 - std::strlen(autonomyName(a))), ' ');
+        os << autonomySummary(a) << "\n";
+    }
+    os << "autonomy = \"" << autonomyName(autonomy) << "\"\n\n";
+
     os << "[launch]\n";
     os << "claude = '" << claudeExe.string() << "'\n";
-    os << "args   = [";
-    for (size_t i = 0; i < claudeArgs.size(); ++i)
-        os << (i ? ", " : "") << '"' << claudeArgs[i] << '"';
+    if (!model.empty())
+        os << "model  = \"" << model << "\"\n";
+    os << "effort = \"" << effort << "\"\n";
+    if (skipPermissionsExplicit) {
+        os << "# Set explicitly, so it no longer follows the autonomy ladder.\n";
+        os << "skip_permissions = " << (skipPermissions ? "true" : "false") << "\n";
+    }
+    os << "extra_args    = [";
+    for (size_t i = 0; i < extraArgs.size(); ++i)
+        os << (i ? ", " : "") << '"' << extraArgs[i] << '"';
     os << "]\n";
     os << "terminal_args = \"" << terminalArgs << "\"\n\n";
 
     os << "[scan]\n";
-    os << "threads            = " << scanThreads << "\n";
+    os << "threads            = " << scanThreads << "   # 0 picks 3/4 of the CPUs\n";
     os << "timeout_ms         = " << probeTimeoutMs << "\n";
     os << "descend_containers = " << (descendContainers ? "true" : "false") << "\n";
     os << "include_plain      = " << (includePlain ? "true" : "false") << "\n";
@@ -337,13 +545,9 @@ bool Config::save(std::string* error) const
         os << (i ? ", " : "") << '"' << githubOwners[i] << '"';
     os << "]\n\n";
 
-    os << "# The multi-repo orchestrator. push stays off by default: a run that\n"
-       << "# commits is reviewable with git log and reversible with git reset,\n"
-       << "# whereas one that pushes has already left the machine.\n";
     os << "[dispatch]\n";
-    os << "commit    = " << (dispatchCommit ? "true" : "false") << "\n";
-    os << "push      = " << (dispatchPush ? "true" : "false") << "\n";
-    os << "max_repos = " << dispatchMaxRepos << "\n\n";
+    os << "max_repos = " << dispatchMaxRepos << "\n";
+    os << "max_items = " << dispatchMaxItems << "\n\n";
 
     os << "[ui]\n";
     os << "sort    = \"" << sort << "\"\n";
@@ -372,6 +576,299 @@ bool Config::save(std::string* error) const
     }
 
     return true;
+}
+
+// ------------------------------------------------------------------ settings
+
+const std::vector<Setting>& settings()
+{
+    static const std::vector<Setting> s = {
+        { "root", "Projects root",
+          "The directory ProjectMan indexes.", SettingKind::Path, nullptr, 0, 0 },
+
+        { "autonomy", "Autonomy",
+          "How far Claude Code may go on its own.", SettingKind::Choice,
+          "suggest,write,commit,push,full", 0, 0 },
+
+        { "launch.effort", "Effort",
+          "Reasoning effort for every session.", SettingKind::Choice,
+          "low,medium,high,xhigh,max", 0, 0 },
+
+        { "launch.model", "Model",
+          "Model alias, or blank for the default.", SettingKind::Choice,
+          ",fable,sonnet,opus", 0, 0 },
+
+        { "launch.skip_permissions", "Skip permissions",
+          "Follows autonomy unless set here.", SettingKind::Bool, nullptr, 0, 0 },
+
+        { "launch.claude", "Claude Code",
+          "Path to claude.exe.", SettingKind::Path, nullptr, 0, 0 },
+
+        { "launch.terminal_args", "Terminal args",
+          "Passed to wt.exe before the working directory.", SettingKind::Text,
+          nullptr, 0, 0 },
+
+        { "ui.on_exit", "When Claude Code exits",
+          "Console only: return to the list, or quit.", SettingKind::Choice,
+          "return,quit,ask", 0, 0 },
+
+        { "ui.sort", "Sort by",
+          "Default order for the list.", SettingKind::Choice,
+          "recent,name,dirty,open", 0, 0 },
+
+        { "dispatch.max_repos", "Dispatch repo cap",
+          "How many repositories a dispatch preselects.", SettingKind::Int,
+          nullptr, 1, 64 },
+
+        { "dispatch.max_items", "Dispatch item cap",
+          "How many items a briefing may carry.", SettingKind::Int, nullptr, 1, 500 },
+
+        { "scan.threads", "Scan threads",
+          "0 picks three quarters of the CPUs.", SettingKind::Int, nullptr, 0, 64 },
+
+        { "scan.include_plain", "Show folders",
+          "List directories that are not git repositories.", SettingKind::Bool,
+          nullptr, 0, 0 },
+
+        { "scan.descend_containers", "Descend containers",
+          "Find repositories one level inside a plain directory.",
+          SettingKind::Bool, nullptr, 0, 0 },
+
+        { "scan.exclude", "Exclude",
+          "Directory names never indexed.", SettingKind::StringList, nullptr, 0, 0 },
+
+        { "github.enabled", "GitHub",
+          "Fetch open pull requests and issues with gh.", SettingKind::Bool,
+          nullptr, 0, 0 },
+
+        { "github.owners", "GitHub owners",
+          "Accounts and organisations to search.", SettingKind::StringList,
+          nullptr, 0, 0 },
+
+        { "github.cache_minutes", "GitHub cache",
+          "Minutes before a refetch.", SettingKind::Int, nullptr, 1, 10080 },
+    };
+    return s;
+}
+
+const Setting* findSetting(std::string_view key)
+{
+    for (const Setting& s : settings()) {
+        if (iequals(s.key, key))
+            return &s;
+    }
+    return nullptr;
+}
+
+std::string readSetting(const Config& cfg, std::string_view key)
+{
+    if (iequals(key, "root"))                     return cfg.root.string();
+    if (iequals(key, "autonomy"))                 return autonomyName(cfg.autonomy);
+    if (iequals(key, "git_exe"))                  return cfg.gitExe.string();
+    if (iequals(key, "launch.claude"))            return cfg.claudeExe.string();
+    if (iequals(key, "launch.model"))             return cfg.model;
+    if (iequals(key, "launch.effort"))            return cfg.effort;
+    if (iequals(key, "launch.terminal_args"))     return cfg.terminalArgs;
+    if (iequals(key, "launch.extra_args"))        return joinList(cfg.extraArgs);
+    if (iequals(key, "launch.skip_permissions")) {
+        return cfg.skipPermissionsExplicit
+                 ? (cfg.skipPermissions ? "true" : "false")
+                 : std::string(cfg.resolvedSkipPermissions() ? "true" : "false")
+                       + " (from autonomy)";
+    }
+    if (iequals(key, "scan.threads"))             return std::to_string(cfg.scanThreads);
+    if (iequals(key, "scan.timeout_ms"))          return std::to_string(cfg.probeTimeoutMs);
+    if (iequals(key, "scan.include_plain"))       return cfg.includePlain ? "true" : "false";
+    if (iequals(key, "scan.descend_containers"))  return cfg.descendContainers ? "true" : "false";
+    if (iequals(key, "scan.exclude"))             return joinList(cfg.exclude);
+    if (iequals(key, "github.enabled"))           return cfg.githubEnabled ? "true" : "false";
+    if (iequals(key, "github.owners"))            return joinList(cfg.githubOwners);
+    if (iequals(key, "github.cache_minutes"))     return std::to_string(cfg.githubCacheMinutes);
+    if (iequals(key, "dispatch.max_repos"))       return std::to_string(cfg.dispatchMaxRepos);
+    if (iequals(key, "dispatch.max_items"))       return std::to_string(cfg.dispatchMaxItems);
+    if (iequals(key, "ui.sort"))                  return cfg.sort;
+    if (iequals(key, "ui.on_exit"))               return toString(cfg.onExit);
+    return {};
+}
+
+bool applySetting(Config& cfg, std::string_view key, std::string_view value,
+                  std::string* error)
+{
+    const Setting* s = findSetting(key);
+    if (!s && !iequals(key, "git_exe") && !iequals(key, "launch.extra_args")
+        && !iequals(key, "scan.timeout_ms")) {
+        if (error)
+            *error = "unknown setting \"" + std::string(key) + "\"";
+        return false;
+    }
+
+    const auto fail = [&](const std::string& msg) {
+        if (error)
+            *error = msg;
+        return false;
+    };
+
+    const auto asInt = [&](int lo, int hi, int* out) {
+        const std::string v(trim(value));
+        if (v.empty() || v.find_first_not_of("-0123456789") != std::string::npos)
+            return false;
+        const long n = std::atol(v.c_str());
+        if (n < lo || n > hi)
+            return false;
+        *out = static_cast<int>(n);
+        return true;
+    };
+
+    if (iequals(key, "root")) {
+        cfg.root = fs::path(widen(trim(value)));
+        return true;
+    }
+    if (iequals(key, "autonomy")) {
+        bool ok = false;
+        const Autonomy a = autonomyFromString(trim(value), &ok);
+        if (!ok)
+            return fail("autonomy must be suggest, write, commit, push or full");
+        cfg.autonomy = a;
+        return true;
+    }
+    if (iequals(key, "git_exe")) {
+        cfg.gitExe = fs::path(widen(trim(value)));
+        return true;
+    }
+    if (iequals(key, "launch.claude")) {
+        cfg.claudeExe = fs::path(widen(trim(value)));
+        return true;
+    }
+    if (iequals(key, "launch.model")) {
+        const std::string v(trim(value));
+        if (!v.empty() && !iequals(v, "fable") && !iequals(v, "sonnet")
+            && !iequals(v, "opus")) {
+            return fail("model must be fable, sonnet, opus, or blank");
+        }
+        cfg.model = toLower(v);
+        return true;
+    }
+    if (iequals(key, "launch.effort")) {
+        const std::string v = toLower(trim(value));
+        if (v != "low" && v != "medium" && v != "high" && v != "xhigh" && v != "max")
+            return fail("effort must be low, medium, high, xhigh or max");
+        cfg.effort = v;
+        return true;
+    }
+    if (iequals(key, "launch.skip_permissions")) {
+        bool b = false;
+        if (!parseBool(trim(value), &b))
+            return fail("expected true or false");
+        cfg.skipPermissions         = b;
+        cfg.skipPermissionsExplicit = true;
+        return true;
+    }
+    if (iequals(key, "launch.terminal_args")) {
+        cfg.terminalArgs = std::string(trim(value));
+        return true;
+    }
+    if (iequals(key, "launch.extra_args")) {
+        cfg.extraArgs = splitList(value);
+        return true;
+    }
+    if (iequals(key, "scan.threads"))
+        return asInt(0, 64, &cfg.scanThreads) || fail("expected 0 to 64");
+    if (iequals(key, "scan.timeout_ms"))
+        return asInt(1000, 600000, &cfg.probeTimeoutMs) || fail("expected 1000 to 600000");
+    if (iequals(key, "scan.include_plain")) {
+        bool b = false;
+        if (!parseBool(trim(value), &b))
+            return fail("expected true or false");
+        cfg.includePlain = b;
+        return true;
+    }
+    if (iequals(key, "scan.descend_containers")) {
+        bool b = false;
+        if (!parseBool(trim(value), &b))
+            return fail("expected true or false");
+        cfg.descendContainers = b;
+        return true;
+    }
+    if (iequals(key, "scan.exclude")) {
+        cfg.exclude = splitList(value);
+        return true;
+    }
+    if (iequals(key, "github.enabled")) {
+        bool b = false;
+        if (!parseBool(trim(value), &b))
+            return fail("expected true or false");
+        cfg.githubEnabled = b;
+        return true;
+    }
+    if (iequals(key, "github.owners")) {
+        cfg.githubOwners = splitList(value);
+        return true;
+    }
+    if (iequals(key, "github.cache_minutes"))
+        return asInt(1, 10080, &cfg.githubCacheMinutes) || fail("expected 1 to 10080");
+    if (iequals(key, "dispatch.max_repos"))
+        return asInt(1, 64, &cfg.dispatchMaxRepos) || fail("expected 1 to 64");
+    if (iequals(key, "dispatch.max_items"))
+        return asInt(1, 500, &cfg.dispatchMaxItems) || fail("expected 1 to 500");
+    if (iequals(key, "ui.sort")) {
+        const std::string v = toLower(trim(value));
+        if (v != "recent" && v != "name" && v != "dirty" && v != "open")
+            return fail("sort must be recent, name, dirty or open");
+        cfg.sort = v;
+        return true;
+    }
+    if (iequals(key, "ui.on_exit")) {
+        bool ok = false;
+        cfg.onExit = onChildExitFromString(trim(value), &ok);
+        return ok || fail("expected return, quit or ask");
+    }
+
+    return fail("unknown setting \"" + std::string(key) + "\"");
+}
+
+std::string cycleSetting(const Config& cfg, std::string_view key, int direction)
+{
+    const Setting* s = findSetting(key);
+    if (!s)
+        return {};
+
+    if (s->kind == SettingKind::Bool)
+        return iequals(readSetting(cfg, key).substr(0, 4), "true") ? "false" : "true";
+
+    if (s->kind == SettingKind::Int) {
+        int  n = std::atoi(readSetting(cfg, key).c_str());
+        // Coarse steps on the wide ranges, so a cache TTL is not 10,080 presses
+        // from one end to the other.
+        const int step = (s->max - s->min) > 200 ? 30 : 1;
+        n = std::clamp(n + direction * step, s->min, s->max);
+        return std::to_string(n);
+    }
+
+    if (s->kind == SettingKind::Choice && s->choices) {
+        const std::vector<std::string> opts = splitList(s->choices);
+        // splitList drops empties, so a leading comma meaning "blank" has to be
+        // put back for launch.model.
+        std::vector<std::string> all;
+        if (s->choices[0] == ',')
+            all.push_back("");
+        all.insert(all.end(), opts.begin(), opts.end());
+        if (all.empty())
+            return {};
+
+        const std::string cur = readSetting(cfg, key);
+        int               idx = 0;
+        for (size_t i = 0; i < all.size(); ++i) {
+            if (iequals(all[i], cur)) {
+                idx = static_cast<int>(i);
+                break;
+            }
+        }
+        const int n = static_cast<int>(all.size());
+        idx = ((idx + direction) % n + n) % n;
+        return all[static_cast<size_t>(idx)];
+    }
+
+    return {};
 }
 
 } // namespace pm
