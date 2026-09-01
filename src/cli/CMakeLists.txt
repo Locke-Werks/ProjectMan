@@ -6,6 +6,7 @@ pm_configure_rc(PM_CLI_RC "pm" "pm.exe" "ProjectMan console")
 add_executable(pm
     main.cpp
     console.cpp
+    tui.cpp
     "${PM_CLI_RC}"
 )
 

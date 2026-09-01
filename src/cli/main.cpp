@@ -5,6 +5,7 @@
 #include "launcher.h"
 #include "scanner.h"
 #include "strutil.h"
+#include "tui.h"
 #include "workitems.h"
 
 #include <algorithm>
@@ -399,7 +400,7 @@ int main(int argc, char** argv)
     if (!cfg.gitExe.empty())
         git::setExePathOverride(cfg.gitExe);
 
-    const std::string verb = a.verb.empty() ? std::string("ls") : a.verb;
+    const std::string verb = a.verb.empty() ? std::string("browse") : a.verb;
 
     // ---------------------------------------------------------------- config
     if (verb == "config") {
@@ -475,6 +476,98 @@ int main(int argc, char** argv)
     NullSink    sink;
     ProjectList projects = scanAll(cfg, sink);
     sortProjects(projects, cfg.sort);
+
+    // ---------------------------------------------------------------- browse
+    if (verb == "browse") {
+        cli::ConsoleSession con;
+
+        // No console means output is redirected or this is CI. Printing the
+        // list is the honest fallback; a TUI would emit escape codes into a
+        // pipe.
+        if (!con.acquire() || !con.enterTui()) {
+            for (const Project& p : projects) {
+                std::printf("%-42s %-26s %-12s %6s\n", p.displayName().substr(0, 42).c_str(),
+                            p.git.branch.substr(0, 26).c_str(), stateWord(p.git).c_str(),
+                            relativeTime(p.activityUnix()).c_str());
+            }
+            return kOk;
+        }
+
+        int exitCode = kOk;
+
+        for (;;) {
+            const cli::BrowseResult r = cli::browse(con, projects, cfg);
+            if (r.action == cli::Action::Quit)
+                break;
+
+            // The console must be fully restored BEFORE the child is spawned:
+            // it inherits this terminal, and it cannot be handed one still in
+            // the alternate buffer with echo and line input switched off. The
+            // output codepage stays UTF-8 for the child's lifetime.
+            con.leaveTui(/*restoreCodepage=*/false);
+
+            if (r.action == cli::Action::OpenTerminal) {
+                std::string lerr;
+                if (r.project && !openInTerminal([&] {
+                        LaunchSpec s;
+                        s.cwd = r.project->path;
+                        return s;
+                    }(), cfg, &lerr)) {
+                    std::fprintf(stderr, "projectman: %s\n", lerr.c_str());
+                }
+                con.enterTui();
+                continue;
+            }
+
+            LaunchSpec s;
+            std::vector<Project*> touched;
+
+            if (r.action == cli::Action::Dispatch) {
+                s = dispatchSpec(r.plan, cfg);
+                for (const fs::path& repo : r.plan.repos) {
+                    for (Project& p : projects) {
+                        if (p.path == repo)
+                            touched.push_back(&p);
+                    }
+                }
+            } else if (r.project) {
+                s.cwd  = r.project->path;
+                s.mode = r.action == cli::Action::LaunchContinue ? LaunchMode::Continue
+                       : r.action == cli::Action::LaunchResume   ? LaunchMode::Resume
+                                                                 : LaunchMode::New;
+                for (Project& p : projects) {
+                    if (p.path == r.project->path)
+                        touched.push_back(&p);
+                }
+            }
+
+            const HandoffResult h = handoff(s, cfg);
+            if (!h.started) {
+                std::fprintf(stderr, "projectman: %s\n", h.error.c_str());
+                exitCode = kLaunchFail;
+            } else {
+                exitCode = h.exitCode;
+            }
+
+            if (cfg.onExit == OnChildExit::Quit) {
+                con.leaveTui(true);
+                return exitCode;
+            }
+
+            // Whatever it worked on has almost certainly changed. Re-probe only
+            // those, which is a few tens of milliseconds rather than a sweep.
+            git::ProbeOptions po;
+            po.timeoutMs = cfg.probeTimeoutMs;
+            for (Project* p : touched)
+                probeProject(*p, po);
+
+            sortProjects(projects, cfg.sort);
+            con.enterTui();
+        }
+
+        con.leaveTui(true);
+        return exitCode;
+    }
 
     // -------------------------------------------------------------------- ls
     if (verb == "ls" || verb == "list") {
