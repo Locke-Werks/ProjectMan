@@ -1,6 +1,7 @@
 #include "config.h"
 #include "console.h"
 #include "discovery.h"
+#include "enrich.h"
 #include "git.h"
 #include "launcher.h"
 #include "scanner.h"
@@ -54,6 +55,7 @@ void printUsage()
         "  pm open <name>              open a new terminal window there\n"
         "  pm items [--json]           every outstanding item across the tree\n"
         "  pm dispatch [options]       run one Claude Code session across repos\n"
+        "  pm refresh                  refetch open pull requests and issues\n"
         "  pm doctor                   resolve git, claude and wt, and time a sweep\n"
         "  pm config [--path|--init]   show, locate or write the config file\n"
         "\n"
@@ -228,6 +230,23 @@ ProjectList scanAll(const Config& cfg, NullSink& sink)
     pool.wait();
 
     return projects;
+}
+
+// The slow half of open items, run only for the verbs that show them. `ls` and
+// `go` do not pay for a GitHub round trip they never display.
+GitHubTotals enrichAll(ProjectList& projects, const Config& cfg, bool forceGitHub)
+{
+    enrichClaudeState(projects, cfg);
+    enrichChecklists(projects, cfg);
+
+    GitHubTotals totals;
+    std::string  ghError;
+    if (!enrichGitHub(projects, cfg, forceGitHub, &totals, &ghError) && !ghError.empty()) {
+        // Not fatal. Everything else on the row is still true, and saying so
+        // beats silently reporting zero open pull requests.
+        std::fprintf(stderr, "projectman: github unavailable: %s\n", ghError.c_str());
+    }
+    return totals;
 }
 
 void sortProjects(ProjectList& v, const std::string& how)
@@ -475,7 +494,38 @@ int main(int argc, char** argv)
     // Every remaining verb needs the tree.
     NullSink    sink;
     ProjectList projects = scanAll(cfg, sink);
+
+    // Only the verbs that display open items pay for them. `ls` and `go` do
+    // not wait on a GitHub round trip they never show.
+    const bool wantsOpenItems = verb == "browse" || verb == "items"
+                             || verb == "dispatch" || verb == "status"
+                             || verb == "refresh";
+    GitHubTotals ghTotals;
+    if (wantsOpenItems)
+        ghTotals = enrichAll(projects, cfg, /*forceGitHub=*/verb == "refresh");
+
     sortProjects(projects, cfg.sort);
+
+    // --------------------------------------------------------------- refresh
+    if (verb == "refresh") {
+        int checklists = 0, sessions = 0, tracked = 0;
+        for (const Project& p : projects) {
+            checklists += p.open.checklistItems;
+            sessions   += p.open.claudeSessions;
+            if (!p.ownerRepo.empty())
+                ++tracked;
+        }
+        // The GitHub numbers come from the fetch, not from summing the
+        // projects: several repositories are checked out two or three times
+        // under this tree, and summing would count their issues once each.
+        std::printf("%-12s %s\n", "cache", githubCachePath().string().c_str());
+        std::printf("%-12s %d pull requests, %d issues across %d repos\n", "github",
+                    ghTotals.prs, ghTotals.issues, ghTotals.repos);
+        std::printf("%-12s %d unchecked boxes\n", "checklists", checklists);
+        std::printf("%-12s %d transcripts\n", "sessions", sessions);
+        std::printf("%-12s %d with a github remote\n", "local", tracked);
+        return kOk;
+    }
 
     // ---------------------------------------------------------------- browse
     if (verb == "browse") {

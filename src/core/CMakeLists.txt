@@ -11,6 +11,7 @@ add_library(pm_core STATIC
     discovery.cpp
     scanner.cpp
     config.cpp
+    enrich.cpp
     workitems.cpp
     launcher.cpp
 )
