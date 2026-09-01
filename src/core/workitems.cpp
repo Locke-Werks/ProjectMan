@@ -217,6 +217,17 @@ DispatchPlan buildDispatchPlan(const WorkList& items, const DispatchOptions& opt
        << plan.repos.size() << (plan.repos.size() == 1 ? " repository" : " repositories")
        << " under this projects tree. Each is available to you via --add-dir.\n\n";
 
+    // Above the items, because an instruction that only turns up after a list of
+    // thirty findings is an instruction the agent reads as an afterthought.
+    if (!opt.instructions.empty()) {
+        os << "What I want done on this run. This governs everything below:\n\n"
+           << opt.instructions << "\n\n";
+
+        os << "The list that follows is context, not the job. Where it and the "
+              "instruction above point in different directions, the instruction "
+              "wins, and an item that has nothing to do with it stays untouched.\n\n";
+    }
+
     os << "Outstanding items, as ProjectMan found them:\n\n";
 
     for (const fs::path& repo : plan.repos) {
@@ -291,8 +302,20 @@ DispatchPlan buildDispatchPlan(const WorkList& items, const DispatchOptions& opt
                        "destructive, irreversible, or a judgement call that is "
                        "mine to make, stop and ask me. Asking is expected, not a "
                        "failure.");
-    rules.emplace_back("Do not start work that was not listed above. If you find "
-                       "something else worth doing, tell me rather than doing it.");
+    // Unqualified, this rule forbids exactly what an instruction like "rename
+    // every default branch" asks for, and the agent would be right to obey the
+    // rule and refuse. It has to name the instruction as a source of work.
+    if (opt.instructions.empty()) {
+        rules.emplace_back("Do not start work that was not listed above. If you "
+                           "find something else worth doing, tell me rather than "
+                           "doing it.");
+    } else {
+        rules.emplace_back("My instruction at the top is a source of work in its "
+                           "own right: do what it asks even where no item below "
+                           "mentions it. Beyond that and the items listed, start "
+                           "nothing. If you find something else worth doing, tell "
+                           "me rather than doing it.");
+    }
 
     os << "How to work:\n\n";
     for (size_t i = 0; i < rules.size(); ++i)

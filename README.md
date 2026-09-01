@@ -56,6 +56,18 @@ its work and not the rest. The session is interactive: it asks when something is
 unclear rather than guessing. By default it commits but never pushes, so every
 result is reviewable with `git log` and reversible with `git reset`.
 
+**General instructions** scope the run to one job across the selected
+repositories rather than working the items as found: "ensure every default
+branch is named main, and rename it where it is not", or "update all docs to
+match the current code state". The text goes in above the item list and governs
+it, and the rule that otherwise forbids unlisted work is relaxed to permit
+exactly what the instruction asks. The item list stays as context. `Ctrl+G` in
+the console, the box in the desktop dialog, or `pm dispatch -i "<text>"`.
+
+**Preview** shows the whole briefing before anything launches, exactly as the
+session receives it. `Ctrl+P` in the console, the PREVIEW button in the desktop
+dialog, or `pm dispatch --dry-run`.
+
 ## Commands
 
 ```
@@ -66,7 +78,7 @@ pm go <name> [-c|-r]        hand this terminal to Claude Code there
 pm open <name>              open a new terminal window there
 pm dock <name>              put Claude Code in a Docked Console column
 pm items [--json]           every outstanding item across the tree
-pm dispatch [--all] [--dry-run]
+pm dispatch [--all] [--dry-run] [-i "<instructions>"]
 pm refresh                  refetch open pull requests and issues
 pm doctor                   resolve git, claude and wt, and time a sweep
 pm config [show|get <key>|set <key> <value>] [--path|--init]
@@ -98,7 +110,8 @@ Every action is Ctrl-modified, because bare letters go to the filter.
 | F5 | rescan |
 | Ctrl+Q | quit |
 
-In the dispatch view: Space toggles, Ctrl+A all, Ctrl+N none, Enter go, Esc back.
+In the dispatch view: Space toggles, Ctrl+A all, Ctrl+N none, Ctrl+G general
+instructions, Ctrl+P preview the briefing, Enter go, Esc back.
 
 ## What counts as outstanding
 

@@ -5,6 +5,21 @@ current terminal to Claude Code in the one you pick. `ProjectMan.exe` shows the
 same data as a desktop dashboard and launches into a new Windows Terminal
 window.
 
+New in 0.3.0: general instructions on a dispatch. A free-text box above the item
+list scopes the run to one job across the selected repositories rather than
+working the items as found: "ensure every default branch is named main, and
+rename it where it is not", or "update all docs to match the current code
+state". It goes into the briefing above the items and governs them, and the rule
+that otherwise forbids unlisted work is relaxed to permit exactly what the
+instruction asks, since without that the session would be right to refuse.
+`Ctrl+G` in the console, the box in the desktop dialog, or
+`pm dispatch -i "<text>"`.
+
+PREVIEW, `Ctrl+P`, shows the whole briefing before anything launches, exactly as
+the session receives it. The console preview scrolls and wraps to the window;
+the desktop one copies to the clipboard. `pm dispatch --dry-run` prints the same
+text.
+
 New in 0.2.0: DOCK, `Ctrl+K`, or `pm dock <name>` puts the session in a [Docked
 Console](https://github.com/Locke-Werks/dockedconsole) column instead of a
 window of its own. No dock running starts one, a column with room takes a

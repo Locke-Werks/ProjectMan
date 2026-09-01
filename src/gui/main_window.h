@@ -15,6 +15,7 @@ class QCheckBox;
 class QFormLayout;
 class QLabel;
 class QLineEdit;
+class QPlainTextEdit;
 class QPushButton;
 class QTableView;
 class QTableWidget;
@@ -71,16 +72,22 @@ public:
     DispatchPlan plan() const { return plan_; }
 
 private:
+    // The three places that build a plan have to agree, or the summary, the
+    // preview and what actually launches drift apart.
+    DispatchOptions options() const;
+
     void rebuildSummary();
+    void showPreview();
     void accept() override;
 
     WorkList      items_;
     const Config& cfg_;
     DispatchPlan  plan_;
 
-    QTableWidget* table_   = nullptr;
-    QLabel*       summary_ = nullptr;
-    QPushButton*  go_      = nullptr;
+    QTableWidget*   table_        = nullptr;
+    QLabel*         summary_      = nullptr;
+    QPushButton*    go_           = nullptr;
+    QPlainTextEdit* instructions_ = nullptr;
 };
 
 // The settings surface, built from core's settings() table so the desktop and

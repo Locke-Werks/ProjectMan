@@ -11,6 +11,7 @@
 
 #include <QApplication>
 #include <QCheckBox>
+#include <QClipboard>
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QFormLayout>
@@ -19,6 +20,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
+#include <QPlainTextEdit>
 #include <QPushButton>
 #include <QResizeEvent>
 #include <QScrollArea>
@@ -144,6 +146,23 @@ DispatchDialog::DispatchDialog(WorkList items, const Config& cfg, QWidget* paren
     blurb->setWordWrap(true);
     root->addWidget(blurb);
 
+    root->addWidget(caption(QStringLiteral("GENERAL INSTRUCTIONS (OPTIONAL)"), kFg4));
+
+    instructions_ = new QPlainTextEdit(this);
+    instructions_->setPlaceholderText(
+        QStringLiteral("One job to do across the selected repositories, in your own "
+                       "words. For example: ensure every default branch is named "
+                       "main, and rename it where it is not. Left empty, the session "
+                       "works the ticked items as found."));
+    instructions_->setFont(theme::mono(11));
+    // Three lines. Enough for a directive, small enough that the item table
+    // stays the thing the dialog is about.
+    instructions_->setFixedHeight(72);
+    root->addWidget(instructions_);
+
+    connect(instructions_, &QPlainTextEdit::textChanged, this,
+            &DispatchDialog::rebuildSummary);
+
     table_ = new QTableWidget(static_cast<int>(items_.size()), 4, this);
     table_->setHorizontalHeaderLabels({ QStringLiteral(""), QStringLiteral("KIND"),
                                         QStringLiteral("PROJECT"),
@@ -200,15 +219,17 @@ DispatchDialog::DispatchDialog(WorkList items, const Config& cfg, QWidget* paren
 
     auto* all = new QPushButton(QStringLiteral("ALL"));
     auto* none = new QPushButton(QStringLiteral("NONE"));
+    auto* preview = new QPushButton(QStringLiteral("PREVIEW"));
     auto* cancel = new QPushButton(QStringLiteral("CANCEL"));
     go_ = new QPushButton(QStringLiteral("GO"));
     go_->setObjectName(QStringLiteral("Primary"));
 
-    for (QPushButton* b : { all, none, cancel, go_ })
+    for (QPushButton* b : { all, none, preview, cancel, go_ })
         b->setFont(theme::tracked(11, QFont::Bold, 0.14));
 
     buttons->addWidget(all);
     buttons->addWidget(none);
+    buttons->addWidget(preview);
     buttons->addWidget(cancel);
     buttons->addWidget(go_);
     root->addLayout(buttons);
@@ -223,20 +244,71 @@ DispatchDialog::DispatchDialog(WorkList items, const Config& cfg, QWidget* paren
     };
     connect(all, &QPushButton::clicked, this, [setAll] { setAll(true); });
     connect(none, &QPushButton::clicked, this, [setAll] { setAll(false); });
+    connect(preview, &QPushButton::clicked, this, &DispatchDialog::showPreview);
     connect(cancel, &QPushButton::clicked, this, &QDialog::reject);
     connect(go_, &QPushButton::clicked, this, &QDialog::accept);
 
     rebuildSummary();
 }
 
-void DispatchDialog::rebuildSummary()
+DispatchOptions DispatchDialog::options() const
 {
     DispatchOptions opt;
-    opt.autonomy = cfg_.autonomy;
-    opt.maxRepos = cfg_.dispatchMaxRepos;
-    opt.maxItems = cfg_.dispatchMaxItems;
+    opt.autonomy     = cfg_.autonomy;
+    opt.maxRepos     = cfg_.dispatchMaxRepos;
+    opt.maxItems     = cfg_.dispatchMaxItems;
+    opt.instructions = instructions_
+                           ? instructions_->toPlainText().trimmed().toStdString()
+                           : std::string();
+    return opt;
+}
 
-    const DispatchPlan preview = buildDispatchPlan(items_, opt);
+void DispatchDialog::showPreview()
+{
+    const DispatchPlan plan = buildDispatchPlan(items_, options());
+
+    QDialog box(this);
+    box.setWindowTitle(QStringLiteral("Briefing"));
+    box.resize(900, 720);
+
+    auto* layout = new QVBoxLayout(&box);
+    layout->setContentsMargins(18, 14, 18, 16);
+    layout->setSpacing(12);
+
+    layout->addWidget(new TrackedLabel(QStringLiteral("// Briefing"), 15, QFont::Bold, 0.18));
+    layout->addWidget(caption(
+        plan.items.empty()
+            ? QStringLiteral("Nothing is selected, so there is no briefing to show.")
+            : QStringLiteral("Exactly what the session is handed, before it starts."),
+        kFg3));
+
+    auto* text = new QPlainTextEdit(QString::fromStdString(plan.briefing), &box);
+    text->setReadOnly(true);
+    text->setFont(theme::mono(11));
+    text->setLineWrapMode(QPlainTextEdit::WidgetWidth);
+    layout->addWidget(text, 1);
+
+    auto* row = new QHBoxLayout;
+    row->addStretch(1);
+    auto* copy  = new QPushButton(QStringLiteral("COPY"));
+    auto* close = new QPushButton(QStringLiteral("CLOSE"));
+    for (QPushButton* b : { copy, close })
+        b->setFont(theme::tracked(11, QFont::Bold, 0.14));
+    row->addWidget(copy);
+    row->addWidget(close);
+    layout->addLayout(row);
+
+    connect(copy, &QPushButton::clicked, &box, [&plan] {
+        QApplication::clipboard()->setText(QString::fromStdString(plan.briefing));
+    });
+    connect(close, &QPushButton::clicked, &box, &QDialog::accept);
+
+    box.exec();
+}
+
+void DispatchDialog::rebuildSummary()
+{
+    const DispatchPlan preview = buildDispatchPlan(items_, options());
     const int          n       = static_cast<int>(preview.items.size());
     const int          repos   = static_cast<int>(preview.repos.size());
 
@@ -253,12 +325,7 @@ void DispatchDialog::rebuildSummary()
 
 void DispatchDialog::accept()
 {
-    DispatchOptions opt;
-    opt.autonomy = cfg_.autonomy;
-    opt.maxRepos = cfg_.dispatchMaxRepos;
-    opt.maxItems = cfg_.dispatchMaxItems;
-
-    plan_ = buildDispatchPlan(items_, opt);
+    plan_ = buildDispatchPlan(items_, options());
     if (plan_.items.empty())
         return;
     QDialog::accept();

@@ -59,6 +59,12 @@ struct DispatchOptions {
     Autonomy autonomy = Autonomy::Commit;
     int      maxRepos = 8;
     int      maxItems = 40;
+
+    // Free text from the person dispatching, folded into the briefing above the
+    // item list and given precedence over it. This is how a run gets scoped to
+    // one job across the selected repositories ("rename every default branch to
+    // main") rather than working the items as found. Empty for an ordinary run.
+    std::string instructions;
 };
 
 // What a dispatch at this rung will and will not do, in one line, for a

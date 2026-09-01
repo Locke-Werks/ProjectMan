@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -86,7 +87,7 @@ std::string relTime(std::int64_t unix)
 
 // ------------------------------------------------------------------- state
 
-enum class View { Projects, Dispatch, Settings };
+enum class View { Projects, Dispatch, Settings, Preview };
 
 struct Ui {
     ProjectList* projects = nullptr;
@@ -103,6 +104,15 @@ struct Ui {
     std::vector<size_t> itemVisible;
     size_t              itemCursor = 0;
     size_t              itemTop    = 0;
+
+    // Free text folded into the briefing above the item list. Edited with the
+    // same editing/editBuffer pair the settings view uses, which is safe
+    // because no two views are ever open at once.
+    std::string instructions;
+
+    // The briefing, wrapped to the window, for the preview view.
+    std::vector<std::string> previewLines;
+    size_t                   previewTop = 0;
 
     size_t      settingCursor = 0;
     size_t      settingTop    = 0;
@@ -142,6 +152,63 @@ void refilterItems(Ui& u)
     }
     if (u.itemCursor >= u.itemVisible.size())
         u.itemCursor = u.itemVisible.empty() ? 0 : u.itemVisible.size() - 1;
+}
+
+// One place, so the count under the list, the preview and what actually
+// launches are all the same plan.
+DispatchOptions dispatchOptions(const Ui& u)
+{
+    DispatchOptions opt;
+    opt.autonomy     = u.cfg->autonomy;
+    opt.maxRepos     = u.cfg->dispatchMaxRepos;
+    opt.maxItems     = u.cfg->dispatchMaxItems;
+    opt.instructions = u.instructions;
+    return opt;
+}
+
+// Wraps the briefing to the window on spaces, keeping its blank lines, so the
+// preview reads as paragraphs rather than one ragged column.
+void buildPreview(Ui& u)
+{
+    const DispatchPlan plan = buildDispatchPlan(u.items, dispatchOptions(u));
+
+    const size_t width = static_cast<size_t>(std::max(20, u.cols - 2));
+
+    u.previewLines.clear();
+    u.previewTop = 0;
+
+    std::string        line;
+    std::istringstream src(plan.briefing);
+    while (std::getline(src, line)) {
+        if (line.size() <= width) {
+            u.previewLines.push_back(line);
+            continue;
+        }
+
+        // Preserve the leading indent on every wrapped fragment, because the
+        // briefing indents item detail under its bullet.
+        size_t indent = line.find_first_not_of(' ');
+        if (indent == std::string::npos)
+            indent = 0;
+        const std::string pad(std::min(indent, width / 2), ' ');
+
+        size_t start = 0;
+        while (start < line.size()) {
+            const size_t room = width - (start == 0 ? 0 : pad.size());
+            if (line.size() - start <= room) {
+                u.previewLines.push_back((start == 0 ? "" : pad) + line.substr(start));
+                break;
+            }
+            size_t cut = line.rfind(' ', start + room);
+            if (cut == std::string::npos || cut <= start)
+                cut = start + room;
+            u.previewLines.push_back((start == 0 ? "" : pad)
+                                     + line.substr(start, cut - start));
+            start = line.find_first_not_of(' ', cut);
+            if (start == std::string::npos)
+                break;
+        }
+    }
 }
 
 void clampScroll(size_t cursor, size_t& top, size_t count, int windowRows)
@@ -344,6 +411,40 @@ void drawItems(std::string& out, const Ui& u, int listRows)
     }
 }
 
+void drawPreview(std::string& out, const Ui& u, int listRows)
+{
+    // No column head here: the briefing is prose, and a header row would only
+    // cost a line of it. One row is spent keeping the frame the same height as
+    // every other view.
+    out += kEol;
+
+    for (int r = 0; r < listRows; ++r) {
+        const size_t li = u.previewTop + static_cast<size_t>(r);
+        if (li >= u.previewLines.size()) {
+            out += kEol;
+            continue;
+        }
+
+        const std::string& line = u.previewLines[li];
+
+        // The briefing's own structure: repo headings and the numbered rules
+        // carry the eye, so they are the only things lifted out of body text.
+        if (line.rfind("## ", 0) == 0)
+            out += fg(kRed);
+        else if (line.rfind("Path: ", 0) == 0)
+            out += fg(kFg4);
+        else if (!line.empty() && line.back() == ':')
+            out += fg(kFg1);
+        else
+            out += fg(kFg2);
+
+        out += " ";
+        out += cell(line, static_cast<size_t>(std::max(0, u.cols - 1)));
+        out += kReset;
+        out += kEol;
+    }
+}
+
 void drawSettings(std::string& out, const Ui& u, int listRows)
 {
     const std::vector<Setting>& all = settings();
@@ -445,10 +546,35 @@ void drawDetail(std::string& out, const Ui& u)
         out += dispatchSummary(u.cfg->autonomy);
         out += kReset;
         out += kEol;
+
+        // The second line is the instructions, because they change what the run
+        // is more than any single ticked item does.
         out += fg(kFg4);
-        out += " Selection is per item, so one repository can contribute some of "
-               "its work and not the rest.";
+        if (u.editing) {
+            out += " instructions: ";
+            out += fg(kFg1);
+            out += cell(u.editBuffer + "_",
+                        static_cast<size_t>(std::max(0, u.cols - 16)));
+        } else if (!u.instructions.empty()) {
+            out += " instructions: ";
+            out += fg(kFg2);
+            out += cell(u.instructions,
+                        static_cast<size_t>(std::max(0, u.cols - 16)));
+        } else {
+            out += " ^G general instructions for this run, ^P to preview the "
+                   "briefing. Selection is per item.";
+        }
         out += kReset;
+        out += kEol;
+        return;
+    }
+
+    if (u.view == View::Preview) {
+        out += fg(kFg4);
+        out += " " + std::to_string(u.previewLines.size()) + " lines. This is the "
+               "whole prompt, exactly as the session receives it.";
+        out += kReset;
+        out += kEol;
         out += kEol;
         return;
     }
@@ -503,8 +629,16 @@ void drawFooter(std::string& out, const Ui& u)
             out += u.editing
                      ? " type to edit   ENTER commit   ESC cancel"
                      : " LEFT/RIGHT change   ENTER edit   ESC back and save   ^Q quit";
+        } else if (u.view == View::Preview) {
+            out += " UP/DOWN scroll   PGUP/PGDN page   HOME/END ends   ESC back";
+        } else if (u.editing) {
+            out += " type the instructions   ENTER commit   ESC cancel";
         } else {
-            out += " SPACE toggle   ^A all   ^N none   ENTER go   ESC back   ^Q quit";
+            out += u.cols >= 112
+                     ? " SPACE toggle   ^A all   ^N none   ^G instructions   "
+                       "^P preview   ENTER go   ESC back   ^Q quit"
+                     : " SPACE tog   ^A all   ^N none   ^G instr   ^P prev   "
+                       "ENTER go   ESC back";
         }
     }
     out += kReset;
@@ -522,12 +656,20 @@ void render(ConsoleSession& con, Ui& u)
     const int chrome   = 11;
     const int listRows = std::max(1, u.rows - chrome);
 
-    if (u.view == View::Projects)
+    if (u.view == View::Projects) {
         clampScroll(u.cursor, u.top, u.visible.size(), listRows);
-    else if (u.view == View::Settings)
+    } else if (u.view == View::Settings) {
         clampScroll(u.settingCursor, u.settingTop, settings().size(), listRows);
-    else
+    } else if (u.view == View::Preview) {
+        // Scrolled directly rather than by a cursor, so there is nothing to
+        // keep in view; only the last page has to stay reachable.
+        const size_t last = u.previewLines.size() > static_cast<size_t>(listRows)
+                              ? u.previewLines.size() - static_cast<size_t>(listRows)
+                              : 0;
+        u.previewTop = std::min(u.previewTop, last);
+    } else {
         clampScroll(u.itemCursor, u.itemTop, u.itemVisible.size(), listRows);
+    }
 
     std::string out;
     out.reserve(static_cast<size_t>(u.cols * u.rows) * 2);
@@ -545,6 +687,13 @@ void render(ConsoleSession& con, Ui& u)
                    + " dirty  " + std::to_string(open) + " open");
     } else if (u.view == View::Settings) {
         header(out, u, "settings", Config::filePath().string());
+    } else if (u.view == View::Preview) {
+        header(out, u, "briefing",
+               std::to_string(u.previewTop + 1) + "-"
+                   + std::to_string(std::min(u.previewLines.size(),
+                                             u.previewTop
+                                                 + static_cast<size_t>(listRows)))
+                   + " of " + std::to_string(u.previewLines.size()));
     } else {
         header(out, u, "dispatch",
                std::to_string(u.itemVisible.size()) + " outstanding");
@@ -556,6 +705,11 @@ void render(ConsoleSession& con, Ui& u)
         out += " Changes are written when you leave this view.";
         out += kReset;
         out += kEol;
+    } else if (u.view == View::Preview) {
+        out += fg(kFg4);
+        out += " Nothing has been launched. ESC goes back to the selection.";
+        out += kReset;
+        out += kEol;
     } else {
         drawFilter(out, u);
     }
@@ -565,6 +719,8 @@ void render(ConsoleSession& con, Ui& u)
         drawProjects(out, u, listRows);
     else if (u.view == View::Settings)
         drawSettings(out, u, listRows);
+    else if (u.view == View::Preview)
+        drawPreview(out, u, listRows);
     else
         drawItems(out, u, listRows);
 
@@ -655,6 +811,68 @@ BrowseResult browse(ConsoleSession& con, ProjectList& projects, Config& cfg)
                     continue;
                 }
                 continue;
+            }
+
+            // Same reasoning as the settings field above: while the
+            // instructions are open, every key is text.
+            if (onItems && u.editing) {
+                if (k.wVirtualKeyCode == VK_RETURN) {
+                    u.instructions = std::string(trim(u.editBuffer));
+                    u.editing      = false;
+                    continue;
+                }
+                if (k.wVirtualKeyCode == VK_ESCAPE) {
+                    u.editing = false;
+                    continue;
+                }
+                if (k.wVirtualKeyCode == VK_BACK) {
+                    if (!u.editBuffer.empty())
+                        u.editBuffer.pop_back();
+                    continue;
+                }
+                if (ch >= 0x20 && ch < 0x7F) {
+                    u.editBuffer.push_back(static_cast<char>(ch));
+                    continue;
+                }
+                continue;
+            }
+
+            // The preview scrolls and does nothing else. Leaving it cannot lose
+            // work, because it never edits anything.
+            if (u.view == View::Preview) {
+                const int page = std::max(1, u.rows - 11);
+                switch (k.wVirtualKeyCode) {
+                case VK_ESCAPE:
+                    u.view = View::Dispatch;
+                    break;
+                case VK_UP:
+                    if (u.previewTop > 0) --u.previewTop;
+                    break;
+                case VK_DOWN:
+                    ++u.previewTop;
+                    break;
+                case VK_PRIOR:
+                    u.previewTop = u.previewTop > static_cast<size_t>(page)
+                                     ? u.previewTop - static_cast<size_t>(page)
+                                     : 0;
+                    break;
+                case VK_NEXT:
+                    u.previewTop += static_cast<size_t>(page);
+                    break;
+                case VK_HOME:
+                    u.previewTop = 0;
+                    break;
+                case VK_END:
+                    u.previewTop = u.previewLines.size();
+                    break;
+                default:
+                    if (isCtrl(k) && (ch == 17 || k.wVirtualKeyCode == 'Q')) {
+                        result.action = Action::Quit;
+                        return result;
+                    }
+                    break;
+                }
+                continue;   // render clamps previewTop to the last page
             }
 
             size_t& cur = onSettings ? u.settingCursor
@@ -755,6 +973,18 @@ BrowseResult browse(ConsoleSession& con, ProjectList& projects, Config& cfg)
                             w.selected = false;
                     }
                     continue;
+                case 'G':
+                    if (onItems) {
+                        u.editBuffer = u.instructions;
+                        u.editing    = true;
+                    }
+                    continue;
+                case 'P':
+                    if (onItems) {
+                        buildPreview(u);
+                        u.view = View::Preview;
+                    }
+                    continue;
                 case 'R':
                     if (!onItems && !onSettings && !u.visible.empty()) {
                         result.action  = Action::LaunchContinue;
@@ -837,12 +1067,7 @@ BrowseResult browse(ConsoleSession& con, ProjectList& projects, Config& cfg)
                     continue;
                 }
                 if (onItems) {
-                    DispatchOptions opt;
-                    opt.autonomy = cfg.autonomy;
-                    opt.maxRepos = cfg.dispatchMaxRepos;
-                    opt.maxItems = cfg.dispatchMaxItems;
-
-                    result.plan = buildDispatchPlan(u.items, opt);
+                    result.plan = buildDispatchPlan(u.items, dispatchOptions(u));
                     if (result.plan.items.empty()) {
                         u.flash = "nothing selected";
                         continue;

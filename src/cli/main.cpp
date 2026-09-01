@@ -98,6 +98,7 @@ void printUsage()
         "  --model <alias>             fable, opus or sonnet\n"
         "  --all                       dispatch: select every outstanding item\n"
         "  --dry-run                   dispatch: print the briefing, launch nothing\n"
+        "  -i, --instructions <text>   dispatch: what to do, above the item list\n"
         "  --root <path>               override the projects root\n"
         "  -h, --help                  this text\n"
         "  -V, --version               version only\n",
@@ -110,7 +111,7 @@ struct Args {
     bool        dirty = false, reposOnly = false, json = false, all = false;
     bool        dryRun = false, wantPath = false, wantInit = false;
     bool        cont = false, resume = false, help = false, version = false;
-    std::string sort, model, resumeId, root;
+    std::string sort, model, resumeId, root, instructions;
     std::string unknown;
 };
 
@@ -143,6 +144,10 @@ Args parseArgs(const std::vector<std::string>& v, std::string* err)
         if (s == "--sort")  { a.sort  = valueFor(v, i, "--sort", err);  continue; }
         if (s == "--model") { a.model = valueFor(v, i, "--model", err); continue; }
         if (s == "--root")  { a.root  = valueFor(v, i, "--root", err);  continue; }
+        if (s == "-i" || s == "--instructions") {
+            a.instructions = valueFor(v, i, "--instructions", err);
+            continue;
+        }
 
         if (s == "-r" || s == "--resume") {
             a.resume = true;
@@ -893,9 +898,10 @@ int main(int argc, char** argv)
         }
 
         DispatchOptions opt;
-        opt.autonomy = cfg.autonomy;
-        opt.maxRepos = cfg.dispatchMaxRepos;
-        opt.maxItems = cfg.dispatchMaxItems;
+        opt.autonomy     = cfg.autonomy;
+        opt.maxRepos     = cfg.dispatchMaxRepos;
+        opt.maxItems     = cfg.dispatchMaxItems;
+        opt.instructions = a.instructions;
 
         const DispatchPlan plan = buildDispatchPlan(items, opt);
         if (plan.items.empty())
