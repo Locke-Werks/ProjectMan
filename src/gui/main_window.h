@@ -127,6 +127,8 @@ private:
     const Project* current() const;
     void launch(LaunchMode mode);
     void openTerminal();
+    void openDock();
+    void offerDockDownload();
     void openDispatch();
     void openSettings();
     void updateCounts();
@@ -154,6 +156,7 @@ private:
     QPushButton* sessions_ = nullptr;
     QPushButton* terminal_ = nullptr;
     QPushButton* dispatch_ = nullptr;
+    QPushButton* dock_     = nullptr;
     QPushButton* settingsBtn_ = nullptr;
 };
 

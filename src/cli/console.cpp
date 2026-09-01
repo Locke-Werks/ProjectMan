@@ -43,6 +43,16 @@ BOOL WINAPI ctrlHandler(DWORD type)
 
 } // namespace
 
+bool stdinIsConsole()
+{
+    const HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
+    if (!in || in == INVALID_HANDLE_VALUE)
+        return false;
+
+    DWORD mode = 0;
+    return GetConsoleMode(in, &mode) != 0;
+}
+
 ConsoleSession::ConsoleSession() { g_session = this; }
 
 ConsoleSession::~ConsoleSession()

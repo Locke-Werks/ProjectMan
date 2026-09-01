@@ -494,8 +494,11 @@ void drawFooter(std::string& out, const Ui& u)
     } else {
         out += fg(kFg4);
         if (u.view == View::Projects) {
-            out += " ENTER launch   ^R continue   ^E resume   ^T terminal   "
-                   "^D dispatch   F2 settings   ^Q quit";
+            out += u.cols >= 112
+                     ? " ENTER launch   ^R continue   ^E resume   ^T terminal   "
+                       "^K dock   ^D dispatch   F2 settings   ^Q quit"
+                     : " ENTER launch   ^R cont   ^E resume   ^T term   "
+                       "^K dock   ^D disp   F2 set   ^Q quit";
         } else if (u.view == View::Settings) {
             out += u.editing
                      ? " type to edit   ENTER commit   ESC cancel"
@@ -769,6 +772,13 @@ BrowseResult browse(ConsoleSession& con, ProjectList& projects, Config& cfg)
                 case 'T':
                     if (!onItems && !onSettings && !u.visible.empty()) {
                         result.action  = Action::OpenTerminal;
+                        result.project = &projects[u.visible[u.cursor]];
+                        return result;
+                    }
+                    continue;
+                case 'K':
+                    if (!onItems && !onSettings && !u.visible.empty()) {
+                        result.action  = Action::OpenDock;
                         result.project = &projects[u.visible[u.cursor]];
                         return result;
                     }

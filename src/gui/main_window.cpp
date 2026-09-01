@@ -1,6 +1,7 @@
 #include "main_window.h"
 
 #include "discovery.h"
+#include "dock.h"
 #include "enrich.h"
 #include "launcher.h"
 #include "project_model.h"
@@ -530,6 +531,7 @@ MainWindow::MainWindow(Config cfg, QWidget* parent)
     dl->addStretch(1);
 
     engage_      = new QPushButton(QStringLiteral("ENGAGE"));
+    dock_        = new QPushButton(QStringLiteral("DOCK"));
     settingsBtn_ = new QPushButton(QStringLiteral("SETTINGS"));
     resume_   = new QPushButton(QStringLiteral("CONTINUE"));
     sessions_ = new QPushButton(QStringLiteral("SESSIONS"));
@@ -538,7 +540,7 @@ MainWindow::MainWindow(Config cfg, QWidget* parent)
     engage_->setObjectName(QStringLiteral("Primary"));
 
     for (QPushButton* b : { engage_, resume_, sessions_, terminal_, dispatch_,
-                            settingsBtn_ })
+                            dock_, settingsBtn_ })
         b->setFont(theme::tracked(11, QFont::Bold, 0.14));
 
     dl->addWidget(engage_);
@@ -548,9 +550,12 @@ MainWindow::MainWindow(Config cfg, QWidget* parent)
     dl->addLayout(row2);
     auto* row3 = new QHBoxLayout;
     row3->addWidget(terminal_);
-    row3->addWidget(dispatch_);
+    row3->addWidget(dock_);
     dl->addLayout(row3);
-    dl->addWidget(settingsBtn_);
+    auto* row4 = new QHBoxLayout;
+    row4->addWidget(dispatch_);
+    row4->addWidget(settingsBtn_);
+    dl->addLayout(row4);
 
     split->addWidget(detail);
     split->setStretchFactor(0, 3);
@@ -579,6 +584,7 @@ MainWindow::MainWindow(Config cfg, QWidget* parent)
     connect(sessions_, &QPushButton::clicked, this, [this] { launch(LaunchMode::Resume); });
     connect(terminal_, &QPushButton::clicked, this, &MainWindow::openTerminal);
     connect(dispatch_, &QPushButton::clicked, this, &MainWindow::openDispatch);
+    connect(dock_, &QPushButton::clicked, this, &MainWindow::openDock);
     connect(settingsBtn_, &QPushButton::clicked, this, &MainWindow::openSettings);
 
     // The same bindings as the console front end, so muscle memory carries
@@ -598,6 +604,7 @@ MainWindow::MainWindow(Config cfg, QWidget* parent)
                   [this] { openTerminal(); });
     new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_Comma), this,
                   [this] { openSettings(); });
+    new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_K), this, [this] { openDock(); });
 
     onSelectionChanged();
     scan_->start(cfg_);
@@ -654,7 +661,7 @@ void MainWindow::onSelectionChanged()
     const Project* p = current();
 
     const bool have = p != nullptr;
-    for (QPushButton* b : { engage_, resume_, sessions_, terminal_ })
+    for (QPushButton* b : { engage_, resume_, sessions_, terminal_, dock_ })
         b->setEnabled(have);
 
     if (!have) {
@@ -731,13 +738,11 @@ void MainWindow::openTerminal()
     if (!p)
         return;
 
-    // A terminal without Claude Code attached. The config's claude args do not
-    // apply, so this goes through the shell rather than the launcher.
-    LaunchSpec s;
-    s.cwd = p->path;
-
+    // A terminal with nothing attached. openInTerminal always appends
+    // claude.exe, so this needs the shell path or TERMINAL is just ENGAGE
+    // again, which is what it was through 0.1.0.
     std::string err;
-    if (!openInTerminal(s, cfg_, &err))
+    if (!openShellInTerminal(p->path, cfg_, &err))
         QMessageBox::warning(this, QStringLiteral("ProjectMan"), QString::fromStdString(err));
 }
 
@@ -761,6 +766,82 @@ void MainWindow::openDispatch()
     std::string err;
     if (!openInTerminal(s, cfg_, &err))
         QMessageBox::warning(this, QStringLiteral("ProjectMan"), QString::fromStdString(err));
+}
+
+void MainWindow::openDock()
+{
+    const Project* p = current();
+    if (!p)
+        return;
+
+    LaunchSpec s;
+    s.cwd = p->path;
+
+    // Starting a cold dock can sit behind a UAC prompt for as long as the user
+    // takes to answer, so the button says what it is doing and stays disabled
+    // rather than freezing the window. Run on the GUI thread all the same: the
+    // work is one SendMessageTimeout plus polling, and threading it would mean
+    // marshalling the result back for a message box.
+    dock_->setEnabled(false);
+    dock_->setText(QStringLiteral("DOCKING"));
+    QApplication::processEvents();
+
+    std::string        detail;
+    const dock::Status st = dock::launch(s, cfg_, &detail);
+
+    dock_->setText(QStringLiteral("DOCK"));
+    dock_->setEnabled(true);
+
+    if (st == dock::Status::Ok)
+        return;
+
+    // Nothing to dock into is the one refusal a person can act on immediately,
+    // so it offers the installer rather than naming a URL to copy out by hand.
+    if (st == dock::Status::NotInstalled) {
+        offerDockDownload();
+        return;
+    }
+
+    QString msg = QString::fromLatin1(dock::statusText(st));
+    if (!detail.empty())
+        msg += QStringLiteral(":\n\n") + QString::fromStdString(detail);
+    QMessageBox::warning(this, QStringLiteral("ProjectMan"), msg);
+}
+
+void MainWindow::offerDockDownload()
+{
+    QMessageBox box(this);
+    box.setIcon(QMessageBox::Warning);
+    box.setWindowTitle(QStringLiteral("ProjectMan"));
+    box.setText(QStringLiteral("Docked Console is not installed."));
+    box.setInformativeText(
+        QStringLiteral("DOCK puts the session in a Docked Console column, so it "
+                       "needs Docked Console 0.4.0 or newer.\n\n"
+                       "If it is already installed somewhere unusual, set "
+                       "dock.exe in Settings instead."));
+
+    QPushButton* get  = box.addButton(QStringLiteral("Download Installer"),
+                                      QMessageBox::AcceptRole);
+    QPushButton* page = box.addButton(QStringLiteral("Release Notes"),
+                                      QMessageBox::ActionRole);
+    box.addButton(QMessageBox::Cancel);
+    box.setDefaultButton(get);
+    box.exec();
+
+    const char* url = nullptr;
+    if (box.clickedButton() == get)
+        url = dock::installerUrl();
+    else if (box.clickedButton() == page)
+        url = dock::releasePage();
+    if (!url)
+        return;
+
+    std::string err;
+    if (!dock::openDownload(url, &err)) {
+        QMessageBox::warning(this, QStringLiteral("ProjectMan"),
+                             QStringLiteral("Could not open a browser:\n\n")
+                                 + QString::fromStdString(err));
+    }
 }
 
 void MainWindow::openSettings()

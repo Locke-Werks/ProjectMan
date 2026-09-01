@@ -69,6 +69,10 @@ struct Config {
     fs::path    terminalExe;   // empty resolves wt.exe
     std::string terminalArgs = "-w new";
 
+    // Dock
+    fs::path dockExe;                    // empty resolves dockedconsole.exe
+    int      dockStartTimeoutMs = 45000; // a cold dock may sit behind a UAC prompt
+
     // Scan
     int                      scanThreads       = 0;   // 0 = defaultScanThreads()
     int                      probeTimeoutMs    = 20000;

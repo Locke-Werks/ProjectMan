@@ -12,6 +12,7 @@ add_library(pm_core STATIC
     scanner.cpp
     config.cpp
     enrich.cpp
+    dock.cpp
     workitems.cpp
     launcher.cpp
 )

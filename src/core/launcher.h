@@ -53,6 +53,13 @@ HandoffResult handoff(const LaunchSpec& s, const Config& cfg);
 // on and the stub's exit says nothing about the session.
 bool openInTerminal(const LaunchSpec& s, const Config& cfg, std::string* error);
 
+// A terminal with nothing attached, in the project directory.
+//
+// Separate because openInTerminal always appends claude.exe: through 0.1.0 the
+// TERMINAL button ran Claude Code exactly like ENGAGE, under a comment claiming
+// it did not.
+bool openShellInTerminal(const fs::path& cwd, const Config& cfg, std::string* error);
+
 // Turn a dispatch plan into a launch: cwd is the projects root, every selected
 // repository is passed with --add-dir, and the briefing becomes the prompt.
 LaunchSpec dispatchSpec(const DispatchPlan& plan, const Config& cfg);

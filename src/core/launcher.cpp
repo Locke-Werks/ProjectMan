@@ -122,6 +122,8 @@ HandoffResult handoff(const LaunchSpec& s, const Config& cfg)
 
     PROCESS_INFORMATION pi{};
 
+    std::vector<wchar_t> env = childEnvironment();
+
     g_childLive.store(true, std::memory_order_release);
 
     const BOOL ok = CreateProcessW(
@@ -129,11 +131,12 @@ HandoffResult handoff(const LaunchSpec& s, const Config& cfg)
         mutableCmd.data(),
         nullptr, nullptr,
         TRUE,        // inherit handles, so the child shares this console
-        0,           // no CREATE_NEW_CONSOLE: that would open a second window.
+        CREATE_UNICODE_ENVIRONMENT,
+                     // no CREATE_NEW_CONSOLE: that would open a second window.
                      // no CREATE_NEW_PROCESS_GROUP either: with it the child
                      // lands in its own group and the console stops delivering
                      // CTRL_C_EVENT to it, so Ctrl+C silently dies inside claude.
-        nullptr,     // inherit the environment
+        env.data(),  // scrubbed, so the session is not born a nested child
         cwdW.empty() ? nullptr : cwdW.c_str(),   // the whole point of the call
         &si, &pi);
 
@@ -156,6 +159,45 @@ HandoffResult handoff(const LaunchSpec& s, const Config& cfg)
     r.started  = true;
     r.exitCode = static_cast<int>(code);
     return r;
+}
+
+bool openShellInTerminal(const fs::path& cwd, const Config& cfg, std::string* error)
+{
+    const fs::path wt = cfg.resolveTerminal();
+    if (wt.empty()) {
+        if (error)
+            *error = "Windows Terminal was not found";
+        return false;
+    }
+
+    // No "--" and no command: wt starts the default profile, which is the whole
+    // point of this being a separate function.
+    std::string cmdline = quoteArg(wt.string()) + " " + cfg.terminalArgs + " -d "
+                        + quoteArg(cwd.string());
+
+    std::wstring mutableCmd = widen(cmdline);
+    mutableCmd.push_back(L'\0');
+
+    const std::wstring exeW = wt.wstring();
+    const std::wstring cwdW = cwd.wstring();
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+
+    std::vector<wchar_t> env = childEnvironment();
+
+    if (!CreateProcessW(exeW.c_str(), mutableCmd.data(), nullptr, nullptr, FALSE,
+                        CREATE_UNICODE_ENVIRONMENT, env.data(),
+                        cwdW.empty() ? nullptr : cwdW.c_str(), &si, &pi)) {
+        if (error)
+            *error = "could not start " + wt.string() + ": " + errorText(GetLastError());
+        return false;
+    }
+
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return true;
 }
 
 bool openInTerminal(const LaunchSpec& s, const Config& cfg, std::string* error)
@@ -200,11 +242,13 @@ bool openInTerminal(const LaunchSpec& s, const Config& cfg, std::string* error)
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
 
+    std::vector<wchar_t> env = childEnvironment();
+
     const BOOL ok = CreateProcessW(
         exeW.c_str(), mutableCmd.data(), nullptr, nullptr,
         FALSE,
-        wt.empty() ? CREATE_NEW_CONSOLE : 0,
-        nullptr,
+        (wt.empty() ? CREATE_NEW_CONSOLE : 0u) | CREATE_UNICODE_ENVIRONMENT,
+        env.data(),
         cwdW.empty() ? nullptr : cwdW.c_str(),
         &si, &pi);
 

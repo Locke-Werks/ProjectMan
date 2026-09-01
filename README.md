@@ -26,6 +26,23 @@ at the list.
 **`ProjectMan.exe`** is the same data as a desktop dashboard. Launching opens a
 new Windows Terminal window in the project directory.
 
+## Docked
+
+DOCK, `Ctrl+K`, or `pm dock <name>` puts the session in a [Docked
+Console](https://github.com/Locke-Werks/dockedconsole) column instead of a
+window of its own. No dock running starts one; a column with room takes a
+horizontal split; a full column gets a new column. Three columns at their pane
+cap refuses and says so rather than falling back to a loose window.
+
+ProjectMan never runs `wt` for this: it sends the dock a request and the dock
+splits itself. Windows Terminal keeps elevated and unelevated windows in
+separate worlds, and aiming `wt` at the wrong one does not fail, it makes a new
+window that permanently steals the name. The dock always splits from the token
+that owns the column.
+
+Needs Docked Console 0.4.0 or newer. An older one cannot take a pane and says
+so. If it is not installed at all, ProjectMan offers the download.
+
 ## Dispatch
 
 When work is outstanding in several repositories at once, `pm dispatch` (or
@@ -47,6 +64,7 @@ pm ls [--dirty] [--repos] [--sort recent|name|dirty|open] [--json]
 pm status <name>            one project in detail
 pm go <name> [-c|-r]        hand this terminal to Claude Code there
 pm open <name>              open a new terminal window there
+pm dock <name>              put Claude Code in a Docked Console column
 pm items [--json]           every outstanding item across the tree
 pm dispatch [--all] [--dry-run]
 pm refresh                  refetch open pull requests and issues
@@ -60,7 +78,8 @@ repository inside a container directory is qualified by it, so
 the one at the root.
 
 Exit codes: 0 ok, 1 error, 2 usage, 3 environment, 4 could not launch, 5 no
-match or ambiguous. When a child ran, `pm` returns the child's code unchanged.
+match or ambiguous, 6 the dock is full. When a child ran, `pm` returns the
+child's code unchanged.
 
 ## Keys
 
@@ -73,6 +92,7 @@ Every action is Ctrl-modified, because bare letters go to the filter.
 | Ctrl+R | continue the last conversation there |
 | Ctrl+E | pick a session to resume |
 | Ctrl+T | open a terminal window |
+| Ctrl+K | put it in a Docked Console column |
 | Ctrl+D | dispatch |
 | F2 | settings (Ctrl+, in the desktop app) |
 | F5 | rescan |
@@ -143,8 +163,9 @@ max_items = 40
 ## Requirements
 
 Windows 11. `git` on PATH. `claude` for launching, `gh` for pull requests and
-issues, and Windows Terminal for the desktop front end; each is optional and
-only that feature is unavailable without it.
+issues, Windows Terminal for the desktop front end, and Docked Console 0.4.0 or
+newer for DOCK; each is optional and only that feature is unavailable without
+it.
 
 ## Building
 

@@ -1,6 +1,7 @@
 #include "config.h"
 #include "console.h"
 #include "discovery.h"
+#include "dock.h"
 #include "enrich.h"
 #include "git.h"
 #include "launcher.h"
@@ -29,6 +30,7 @@ constexpr int kUsage      = 2;
 constexpr int kEnvironment = 3;
 constexpr int kLaunchFail = 4;
 constexpr int kNoMatch    = 5;
+constexpr int kDockFull   = 6;
 
 int fail(const std::string& msg)
 {
@@ -42,6 +44,31 @@ int failWith(int code, const std::string& msg)
     return code;
 }
 
+// Offers the installer when the dock turns out not to be installed. Only asks
+// on a real console: a piped or scheduled run has nobody to answer and would
+// block on the read, and the URL is in the refusal message either way.
+void offerDockDownload()
+{
+    if (!cli::stdinIsConsole())
+        return;
+
+    std::fprintf(stderr, "  download it now? [y/N] ");
+    std::fflush(stderr);
+
+    char answer[16] = {};
+    if (!std::fgets(answer, sizeof(answer), stdin))
+        return;
+    if (answer[0] != 'y' && answer[0] != 'Y')
+        return;
+
+    std::string err;
+    if (dock::openDownload(dock::installerUrl(), &err))
+        std::fprintf(stderr, "  opening %s\n", dock::installerUrl());
+    else
+        std::fprintf(stderr, "projectman: could not open a browser: %s\n",
+                     err.c_str());
+}
+
 void printUsage()
 {
     std::fputs(
@@ -52,7 +79,8 @@ void printUsage()
         "  pm ls [options]             list projects\n"
         "  pm status <name>            one project in detail\n"
         "  pm go <name> [options]      hand this terminal to Claude Code there\n"
-        "  pm open <name>              open a new terminal window there\n"
+        "  pm open <name>              open a plain terminal there\n"
+        "  pm dock <name>              put Claude Code in a Docked Console column\n"
         "  pm items [--json]           every outstanding item across the tree\n"
         "  pm dispatch [options]       run one Claude Code session across repos\n"
         "  pm refresh                  refetch open pull requests and issues\n"
@@ -496,6 +524,15 @@ int main(int argc, char** argv)
         std::printf("%-10s %s\n", "wt",
                     wt.empty() ? "not present (falls back to a new console)"
                                : wt.string().c_str());
+        const fs::path dk = dock::resolveExe(cfg);
+        std::printf("%-10s %s\n", "dock",
+                    dk.empty() ? "not installed" : dk.string().c_str());
+        const dock::State ds = dock::discover();
+        if (ds.running) {
+            std::printf("%-10s running, %d column%s, %s\n", "",
+                        ds.columns, ds.columns == 1 ? "" : "s",
+                        ds.elevated ? "elevated" : "not elevated");
+        }
         std::printf("%-10s %s\n", "config", Config::filePath().string().c_str());
         std::printf("%-10s %s\n", "root", cfg.root.string().c_str());
 
@@ -595,12 +632,33 @@ int main(int argc, char** argv)
 
             if (r.action == cli::Action::OpenTerminal) {
                 std::string lerr;
-                if (r.project && !openInTerminal([&] {
-                        LaunchSpec s;
-                        s.cwd = r.project->path;
-                        return s;
-                    }(), cfg, &lerr)) {
+                if (r.project && !openShellInTerminal(r.project->path, cfg, &lerr))
                     std::fprintf(stderr, "projectman: %s\n", lerr.c_str());
+                con.enterTui();
+                continue;
+            }
+
+            if (r.action == cli::Action::OpenDock) {
+                if (r.project) {
+                    // Starting a cold dock can sit behind a UAC prompt for as
+                    // long as the user takes to answer it, and the alternate
+                    // buffer is already gone, so say what is happening rather
+                    // than leaving a dead terminal.
+                    std::fprintf(stderr, "projectman: docking %s...\n",
+                                 r.project->displayName().c_str());
+
+                    LaunchSpec s;
+                    s.cwd = r.project->path;
+
+                    std::string why;
+                    const dock::Status st = dock::launch(s, cfg, &why);
+                    if (st != dock::Status::Ok) {
+                        std::fprintf(stderr, "projectman: %s%s%s\n",
+                                     dock::statusText(st),
+                                     why.empty() ? "" : ": ", why.c_str());
+                        if (st == dock::Status::NotInstalled)
+                            offerDockDownload();
+                    }
                 }
                 con.enterTui();
                 continue;
@@ -734,17 +792,45 @@ int main(int argc, char** argv)
         if (!p)
             return failWith(kNoMatch, err);
 
+        std::string lerr;
+        if (!openShellInTerminal(p->path, cfg, &lerr))
+            return failWith(kLaunchFail, lerr);
+        return kOk;
+    }
+
+    // ------------------------------------------------------------------ dock
+    if (verb == "dock") {
+        if (a.positional.empty())
+            return failWith(kUsage, "usage: pm dock <name>");
+
+        std::string  err;
+        const Project* p = resolveOne(projects, a.positional[0], &err);
+        if (!p)
+            return failWith(kNoMatch, err);
+
         LaunchSpec s;
-        s.cwd   = p->path;
-        s.mode  = a.cont ? LaunchMode::Continue
-                         : (a.resume ? LaunchMode::Resume : LaunchMode::New);
+        s.cwd      = p->path;
+        s.mode     = a.cont ? LaunchMode::Continue
+                            : (a.resume ? LaunchMode::Resume : LaunchMode::New);
         s.resumeId = a.resumeId;
         s.model    = a.model;
 
-        std::string lerr;
-        if (!openInTerminal(s, cfg, &lerr))
-            return failWith(kLaunchFail, lerr);
-        return kOk;
+        std::string why;
+        const dock::Status st = dock::launch(s, cfg, &why);
+        if (st == dock::Status::Ok) {
+            std::printf("docked %s\n", p->displayName().c_str());
+            return kOk;
+        }
+
+        std::string msg = dock::statusText(st);
+        if (!why.empty())
+            msg += ": " + why;
+
+        const int code = failWith(st == dock::Status::Full ? kDockFull : kLaunchFail,
+                                  msg);
+        if (st == dock::Status::NotInstalled)
+            offerDockDownload();
+        return code;
     }
 
     // -------------------------------------------------------------------- go

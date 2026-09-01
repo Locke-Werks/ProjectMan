@@ -16,6 +16,7 @@ enum class Action {
     LaunchContinue,
     LaunchResume,
     OpenTerminal,
+    OpenDock,
     Dispatch,
 };
 

@@ -122,6 +122,61 @@ std::string quoteArg(std::string_view arg)
     return out;
 }
 
+std::vector<wchar_t> childEnvironment()
+{
+    // Session-scoped runtime state, not user configuration. Anything else
+    // beginning CLAUDE_CODE_ is left alone, because a person may have set it
+    // deliberately and it is not ours to drop.
+    static const wchar_t* kStrip[] = {
+        L"CLAUDE_CODE_CHILD_SESSION",
+        L"CLAUDE_CODE_SESSION_ID",
+        L"CLAUDE_CODE_BRIDGE_SESSION_ID",
+        L"CLAUDE_CODE_MESSAGING_SOCKET",
+        L"CLAUDE_CODE_MESSAGING_TOKEN",
+        L"CLAUDE_CODE_ENTRYPOINT",
+        L"CLAUDE_CODE_EXECPATH",
+    };
+
+    std::vector<wchar_t> out;
+
+    wchar_t* block = GetEnvironmentStringsW();
+    if (!block) {
+        out.push_back(L'\0');
+        out.push_back(L'\0');
+        return out;
+    }
+
+    for (const wchar_t* entry = block; *entry;) {
+        const size_t len = wcslen(entry);
+
+        const wchar_t* eq = wcschr(entry, L'=');
+        bool drop = false;
+        if (eq && eq != entry) {
+            const size_t nameLen = static_cast<size_t>(eq - entry);
+            for (const wchar_t* name : kStrip) {
+                if (wcslen(name) == nameLen
+                    && _wcsnicmp(entry, name, nameLen) == 0) {
+                    drop = true;
+                    break;
+                }
+            }
+        }
+
+        if (!drop)
+            out.insert(out.end(), entry, entry + len + 1);   // keep the NUL
+
+        entry += len + 1;
+    }
+
+    FreeEnvironmentStringsW(block);
+
+    // A block of nothing but the terminator still has to be double-NUL.
+    if (out.empty())
+        out.push_back(L'\0');
+    out.push_back(L'\0');
+    return out;
+}
+
 ProcResult run(const fs::path& exe, const std::vector<std::string>& args,
                const fs::path& cwd, int timeoutMs)
 {

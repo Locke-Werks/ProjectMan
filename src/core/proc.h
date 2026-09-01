@@ -39,4 +39,18 @@ std::string quoteArg(std::string_view arg);
 // FormatMessageW for a GetLastError() value, trimmed to one line.
 std::string errorText(unsigned long code);
 
+// This process's environment, minus the markers that tell Claude Code it is a
+// nested child of another session.
+//
+// ProjectMan is very often launched from inside a Claude Code session, and a
+// plain inherited environment carries CLAUDE_CODE_CHILD_SESSION into every
+// session it starts. Claude Code answers that marker by turning transcript
+// saving off, which costs the new session its history, its --continue, and its
+// place in ProjectMan's own list of unfinished work. A session ProjectMan
+// launches is a new top-level session, so it gets a clean slate.
+//
+// Returns a double-NUL-terminated block for CreateProcessW, which needs
+// CREATE_UNICODE_ENVIRONMENT alongside it.
+std::vector<wchar_t> childEnvironment();
+
 } // namespace pm

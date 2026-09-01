@@ -68,6 +68,8 @@ const std::set<std::string> kKnownKeys = {
     "github.enabled",
     "github.owners",
     "github.cache_minutes",
+    "dock.exe",
+    "dock.start_timeout_ms",
     "dispatch.max_repos",
     "dispatch.max_items",
     // Superseded by the autonomy ladder. Still recognised so a config written
@@ -444,6 +446,11 @@ Config Config::load(ConfigStatus* status, std::string* detail)
     if (tbl["github"]["owners"].is_array())
         c.githubOwners = stringArray(tbl["github"]["owners"]);
 
+    if (const auto v = str("dock", "exe"))
+        c.dockExe = fs::path(widen(*v));
+    c.dockStartTimeoutMs =
+        tbl["dock"]["start_timeout_ms"].value_or(c.dockStartTimeoutMs);
+
     c.dispatchMaxRepos = tbl["dispatch"]["max_repos"].value_or(c.dispatchMaxRepos);
     c.dispatchMaxItems = tbl["dispatch"]["max_items"].value_or(c.dispatchMaxItems);
 
@@ -545,6 +552,11 @@ bool Config::save(std::string* error) const
         os << (i ? ", " : "") << '"' << githubOwners[i] << '"';
     os << "]\n\n";
 
+    os << "[dock]\n";
+    if (!dockExe.empty())
+        os << "exe = '" << dockExe.string() << "'\n";
+    os << "start_timeout_ms = " << dockStartTimeoutMs << "\n\n";
+
     os << "[dispatch]\n";
     os << "max_repos = " << dispatchMaxRepos << "\n";
     os << "max_items = " << dispatchMaxItems << "\n\n";
@@ -616,6 +628,14 @@ const std::vector<Setting>& settings()
           "Default order for the list.", SettingKind::Choice,
           "recent,name,dirty,open", 0, 0 },
 
+        { "dock.exe", "Docked Console",
+          "Path to dockedconsole.exe. Blank finds it.", SettingKind::Path,
+          nullptr, 0, 0 },
+
+        { "dock.start_timeout_ms", "Dock start wait",
+          "Milliseconds to wait for a cold dock, which may sit behind a UAC prompt.",
+          SettingKind::Int, nullptr, 5000, 180000 },
+
         { "dispatch.max_repos", "Dispatch repo cap",
           "How many repositories a dispatch preselects.", SettingKind::Int,
           nullptr, 1, 64 },
@@ -684,6 +704,8 @@ std::string readSetting(const Config& cfg, std::string_view key)
     if (iequals(key, "github.enabled"))           return cfg.githubEnabled ? "true" : "false";
     if (iequals(key, "github.owners"))            return joinList(cfg.githubOwners);
     if (iequals(key, "github.cache_minutes"))     return std::to_string(cfg.githubCacheMinutes);
+    if (iequals(key, "dock.exe"))                 return cfg.dockExe.string();
+    if (iequals(key, "dock.start_timeout_ms"))    return std::to_string(cfg.dockStartTimeoutMs);
     if (iequals(key, "dispatch.max_repos"))       return std::to_string(cfg.dispatchMaxRepos);
     if (iequals(key, "dispatch.max_items"))       return std::to_string(cfg.dispatchMaxItems);
     if (iequals(key, "ui.sort"))                  return cfg.sort;
@@ -806,6 +828,13 @@ bool applySetting(Config& cfg, std::string_view key, std::string_view value,
     }
     if (iequals(key, "github.cache_minutes"))
         return asInt(1, 10080, &cfg.githubCacheMinutes) || fail("expected 1 to 10080");
+    if (iequals(key, "dock.exe")) {
+        cfg.dockExe = fs::path(widen(trim(value)));
+        return true;
+    }
+    if (iequals(key, "dock.start_timeout_ms"))
+        return asInt(5000, 180000, &cfg.dockStartTimeoutMs)
+            || fail("expected 5000 to 180000");
     if (iequals(key, "dispatch.max_repos"))
         return asInt(1, 64, &cfg.dispatchMaxRepos) || fail("expected 1 to 64");
     if (iequals(key, "dispatch.max_items"))

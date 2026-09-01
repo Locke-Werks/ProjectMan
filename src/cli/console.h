@@ -5,6 +5,11 @@
 
 namespace pm::cli {
 
+// True only when stdin is a real console, so a prompt has somebody to answer
+// it. _isatty is not enough: it is also true for NUL and every other character
+// device, so a redirected or scheduled run would still stop and ask.
+bool stdinIsConsole();
+
 // Owns the console's mode, codepage and cursor state, and puts it all back.
 //
 // Restoration is idempotent and happens on every exit path: the destructor, the
