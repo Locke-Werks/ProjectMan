@@ -73,6 +73,12 @@ struct Config {
     fs::path dockExe;                    // empty resolves dockedconsole.exe
     int      dockStartTimeoutMs = 45000; // a cold dock may sit behind a UAC prompt
 
+    // Whether an ordinary launch goes to a Docked Console column. Auto means
+    // it does whenever Docked Console can be found, which is the point: the
+    // dock is where terminals live, so nothing should have to ask for it.
+    // Holding Shift over a launch forces a loose window for that one launch.
+    bool dockAuto = true;
+
     // Scan
     int                      scanThreads       = 0;   // 0 = defaultScanThreads()
     int                      probeTimeoutMs    = 20000;

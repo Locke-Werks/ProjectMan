@@ -99,6 +99,7 @@ void printUsage()
         "  --all                       dispatch: select every outstanding item\n"
         "  --dry-run                   dispatch: print the briefing, launch nothing\n"
         "  -i, --instructions <text>   dispatch: what to do, above the item list\n"
+        "  --window                    go/open: a loose window, not the dock\n"
         "  --root <path>               override the projects root\n"
         "  -h, --help                  this text\n"
         "  -V, --version               version only\n",
@@ -112,6 +113,7 @@ struct Args {
     bool        dryRun = false, wantPath = false, wantInit = false;
     bool        cont = false, resume = false, help = false, version = false;
     std::string sort, model, resumeId, root, instructions;
+    bool        window = false;   // force a loose window over the dock
     std::string unknown;
 };
 
@@ -133,6 +135,7 @@ Args parseArgs(const std::vector<std::string>& v, std::string* err)
 
         if (s == "-h" || s == "--help")            { a.help = true; continue; }
         if (s == "-V" || s == "--version")         { a.version = true; continue; }
+        if (s == "--window")                       { a.window = true; continue; }
         if (s == "--dirty")                        { a.dirty = true; continue; }
         if (s == "--repos")                        { a.reposOnly = true; continue; }
         if (s == "--json")                         { a.json = true; continue; }
@@ -169,26 +172,6 @@ Args parseArgs(const std::vector<std::string>& v, std::string* err)
             a.positional.push_back(s);
     }
     return a;
-}
-
-std::string relativeTime(std::int64_t unix)
-{
-    if (unix <= 0)
-        return "-";
-
-    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                         std::chrono::system_clock::now().time_since_epoch())
-                         .count();
-    std::int64_t d = now - unix;
-    if (d < 0)
-        d = 0;
-
-    if (d < 60)          return std::to_string(d) + "s";
-    if (d < 3600)        return std::to_string(d / 60) + "m";
-    if (d < 86400)       return std::to_string(d / 3600) + "h";
-    if (d < 86400 * 30)  return std::to_string(d / 86400) + "d";
-    if (d < 86400 * 365) return std::to_string(d / (86400 * 30)) + "mo";
-    return std::to_string(d / (86400 * 365)) + "y";
 }
 
 std::string kindWord(ProjectKind k)
@@ -617,7 +600,7 @@ int main(int argc, char** argv)
             for (const Project& p : projects) {
                 std::printf("%-42s %-26s %-12s %6s\n", p.displayName().substr(0, 42).c_str(),
                             p.git.branch.substr(0, 26).c_str(), stateWord(p.git).c_str(),
-                            relativeTime(p.activityUnix()).c_str());
+                            relativeAge(p.activityUnix()).c_str());
             }
             return kOk;
         }
@@ -639,32 +622,6 @@ int main(int argc, char** argv)
                 std::string lerr;
                 if (r.project && !openShellInTerminal(r.project->path, cfg, &lerr))
                     std::fprintf(stderr, "projectman: %s\n", lerr.c_str());
-                con.enterTui();
-                continue;
-            }
-
-            if (r.action == cli::Action::OpenDock) {
-                if (r.project) {
-                    // Starting a cold dock can sit behind a UAC prompt for as
-                    // long as the user takes to answer it, and the alternate
-                    // buffer is already gone, so say what is happening rather
-                    // than leaving a dead terminal.
-                    std::fprintf(stderr, "projectman: docking %s...\n",
-                                 r.project->displayName().c_str());
-
-                    LaunchSpec s;
-                    s.cwd = r.project->path;
-
-                    std::string why;
-                    const dock::Status st = dock::launch(s, cfg, &why);
-                    if (st != dock::Status::Ok) {
-                        std::fprintf(stderr, "projectman: %s%s%s\n",
-                                     dock::statusText(st),
-                                     why.empty() ? "" : ": ", why.c_str());
-                        if (st == dock::Status::NotInstalled)
-                            offerDockDownload();
-                    }
-                }
                 con.enterTui();
                 continue;
             }
@@ -736,7 +693,7 @@ int main(int argc, char** argv)
                             disp.substr(0, 42).c_str(),
                             p.git.branch.substr(0, 26).c_str(),
                             stateWord(p.git).c_str(), syncWord(p.git).c_str(),
-                            relativeTime(p.activityUnix()).c_str(),
+                            relativeAge(p.activityUnix()).c_str(),
                             kindWord(p.kind).c_str());
             }
             ++shown;
@@ -777,7 +734,7 @@ int main(int argc, char** argv)
                 std::printf("  %-12s %d\n", "stashes", p->git.stashes);
             if (p->git.lastCommitUnix) {
                 std::printf("  %-12s %s ago by %s\n", "last commit",
-                            relativeTime(p->git.lastCommitUnix).c_str(),
+                            relativeAge(p->git.lastCommitUnix).c_str(),
                             p->git.lastCommitAuthor.c_str());
                 std::printf("  %-12s %s\n", "", p->git.lastCommitSubject.c_str());
             }
@@ -796,6 +753,18 @@ int main(int argc, char** argv)
         const Project* p = resolveOne(projects, a.positional[0], &err);
         if (!p)
             return failWith(kNoMatch, err);
+
+        if (!a.window && dock::available(cfg)) {
+            std::string        why;
+            const dock::Status st = dock::launchShell(p->path, cfg, &why);
+            if (st == dock::Status::Ok) {
+                std::printf("docked a shell in %s\n", p->displayName().c_str());
+                return kOk;
+            }
+            std::fprintf(stderr, "projectman: %s%s%s\n", dock::statusText(st),
+                         why.empty() ? "" : ": ", why.c_str());
+            std::fprintf(stderr, "projectman: opening a window instead\n");
+        }
 
         std::string lerr;
         if (!openShellInTerminal(p->path, cfg, &lerr))
@@ -854,6 +823,24 @@ int main(int argc, char** argv)
                             : (a.resume ? LaunchMode::Resume : LaunchMode::New);
         s.resumeId = a.resumeId;
         s.model    = a.model;
+
+        // The dock is where terminals live when it is installed, so an ordinary
+        // launch goes there and this returns rather than blocking. --window is
+        // the way back to handing over this terminal.
+        if (!a.window && dock::available(cfg)) {
+            std::string        why;
+            const dock::Status st = dock::launch(s, cfg, &why);
+            if (st == dock::Status::Ok) {
+                std::printf("docked %s\n", p->displayName().c_str());
+                return kOk;
+            }
+            // A refusal must not strand the launch: the dock being full is not
+            // a reason to do nothing, it is a reason to fall back to what this
+            // did before the dock existed.
+            std::fprintf(stderr, "projectman: %s%s%s\n", dock::statusText(st),
+                         why.empty() ? "" : ": ", why.c_str());
+            std::fprintf(stderr, "projectman: handing over this terminal instead\n");
+        }
 
         const HandoffResult h = handoff(s, cfg);
         if (!h.started)

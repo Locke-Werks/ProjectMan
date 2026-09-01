@@ -1,5 +1,6 @@
 #include "tui.h"
 
+#include "dock.h"
 #include "launcher.h"
 #include "strutil.h"
 #include "theme.h"
@@ -68,23 +69,6 @@ std::string cell(std::string_view s, size_t width)
     return out;
 }
 
-std::string relTime(std::int64_t unix)
-{
-    if (unix <= 0)
-        return "-";
-    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                         std::chrono::system_clock::now().time_since_epoch())
-                         .count();
-    std::int64_t d = now - unix;
-    if (d < 0)
-        d = 0;
-    if (d < 3600)        return std::to_string(d / 60) + "m";
-    if (d < 86400)       return std::to_string(d / 3600) + "h";
-    if (d < 86400 * 30)  return std::to_string(d / 86400) + "d";
-    if (d < 86400 * 365) return std::to_string(d / (86400 * 30)) + "mo";
-    return std::to_string(d / (86400 * 365)) + "y";
-}
-
 // ------------------------------------------------------------------- state
 
 enum class View { Projects, Dispatch, Settings, Preview };
@@ -123,8 +107,35 @@ struct Ui {
     int cols = 100;
     int rows = 30;
 
+    // Resolved once. dock::available reads the registry, and this is consulted
+    // on every frame to label the footer.
+    bool dockReady = false;
+
     std::string flash;   // a transient message on the footer line
 };
+
+// Puts a project in a dock column without leaving the list. Returns what to say
+// on the footer, empty when the caller should fall back to its own behaviour.
+//
+// Only ever called with a dock available, so a refusal here means the dock is
+// full or shutting down, not that it is missing.
+std::string dockFromList(const Ui& u, const Project& p, bool shell,
+                         std::string* refusal)
+{
+    LaunchSpec s;
+    s.cwd = p.path;
+
+    std::string        why;
+    const dock::Status st = shell ? dock::launchShell(p.path, *u.cfg, &why)
+                                  : dock::launch(s, *u.cfg, &why);
+
+    if (st == dock::Status::Ok)
+        return (shell ? "shell docked in " : "docked ") + p.displayName();
+
+    if (refusal)
+        *refusal = dock::statusText(st);
+    return {};
+}
 
 void refilter(Ui& u)
 {
@@ -359,7 +370,7 @@ void drawProjects(std::string& out, const Ui& u, int listRows)
         out += cell(syncCell(p.git), 12);
         out += " ";
         out += fg(kFg4);
-        out += relTime(p.activityUnix());
+        out += relativeAge(p.activityUnix());
         out += kReset;
         out += kEol;
     }
@@ -600,7 +611,7 @@ void drawDetail(std::string& out, const Ui& u)
     out += fg(kFg3);
     out += " ";
     if (p.git.lastCommitUnix) {
-        out += relTime(p.git.lastCommitUnix) + " ago  "
+        out += relativeAge(p.git.lastCommitUnix) + " ago  "
              + cell(p.git.lastCommitSubject,
                     static_cast<size_t>(std::max(0, u.cols - 14)));
     } else if (!p.git.error.empty()) {
@@ -620,11 +631,14 @@ void drawFooter(std::string& out, const Ui& u)
     } else {
         out += fg(kFg4);
         if (u.view == View::Projects) {
+            // The legend says where a launch lands, which is the whole of the
+            // indication that the dock is in play. Shift is on the same key.
+            const char* go = u.dockReady ? " ENTER dock (+SHIFT here)" : " ENTER launch";
+            out += go;
             out += u.cols >= 112
-                     ? " ENTER launch   ^R continue   ^E resume   ^T terminal   "
-                       "^K dock   ^D dispatch   F2 settings   ^Q quit"
-                     : " ENTER launch   ^R cont   ^E resume   ^T term   "
-                       "^K dock   ^D disp   F2 set   ^Q quit";
+                     ? "   ^R continue   ^E resume   ^T terminal   "
+                       "^D dispatch   F2 settings   ^Q quit"
+                     : "   ^R cont   ^E resume   ^T term   ^D disp   F2 set   ^Q quit";
         } else if (u.view == View::Settings) {
             out += u.editing
                      ? " type to edit   ENTER commit   ESC cancel"
@@ -749,6 +763,7 @@ BrowseResult browse(ConsoleSession& con, ProjectList& projects, Config& cfg)
     Ui u;
     u.projects = &projects;
     u.cfg      = &cfg;
+    u.dockReady = dock::available(cfg);
     refilter(u);
 
     const HANDLE in = static_cast<HANDLE>(con.inputHandle());
@@ -1001,15 +1016,22 @@ BrowseResult browse(ConsoleSession& con, ProjectList& projects, Config& cfg)
                     continue;
                 case 'T':
                     if (!onItems && !onSettings && !u.visible.empty()) {
+                        Project&   p = projects[u.visible[u.cursor]];
+                        const bool loose =
+                            (k.dwControlKeyState & SHIFT_PRESSED) != 0;
+
+                        if (u.dockReady && !loose) {
+                            std::string refusal;
+                            const std::string said = dockFromList(u, p, true, &refusal);
+                            if (!said.empty()) {
+                                u.flash = said;
+                                continue;
+                            }
+                            u.flash = refusal + "; opening a window";
+                        }
+
                         result.action  = Action::OpenTerminal;
-                        result.project = &projects[u.visible[u.cursor]];
-                        return result;
-                    }
-                    continue;
-                case 'K':
-                    if (!onItems && !onSettings && !u.visible.empty()) {
-                        result.action  = Action::OpenDock;
-                        result.project = &projects[u.visible[u.cursor]];
+                        result.project = &p;
                         return result;
                     }
                     continue;
@@ -1031,7 +1053,10 @@ BrowseResult browse(ConsoleSession& con, ProjectList& projects, Config& cfg)
                         }
                         u.settingsDirty = false;
                     }
-                    u.view = View::Projects;
+                    // dock.use_dock is one of the settings just edited, and the
+                    // footer legend is drawn from this.
+                    u.dockReady = dock::available(*u.cfg);
+                    u.view      = View::Projects;
                     refilter(u);
                 } else if (onItems) {
                     u.view = View::Projects;
@@ -1076,8 +1101,26 @@ BrowseResult browse(ConsoleSession& con, ProjectList& projects, Config& cfg)
                     return result;
                 }
                 if (!u.visible.empty()) {
+                    Project& p = projects[u.visible[u.cursor]];
+
+                    // Shift is the way back to the old behaviour: hand over this
+                    // terminal rather than putting the session in a column.
+                    const bool loose = (k.dwControlKeyState & SHIFT_PRESSED) != 0;
+
+                    if (u.dockReady && !loose) {
+                        std::string refusal;
+                        const std::string said = dockFromList(u, p, false, &refusal);
+                        if (!said.empty()) {
+                            u.flash = said;
+                            continue;   // the list stays up
+                        }
+                        // The dock being full is a reason to fall back, not a
+                        // reason to launch nothing.
+                        u.flash = refusal + "; handing over this terminal";
+                    }
+
                     result.action  = Action::LaunchNew;
-                    result.project = &projects[u.visible[u.cursor]];
+                    result.project = &p;
                     return result;
                 }
                 continue;

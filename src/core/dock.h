@@ -63,4 +63,14 @@ bool openDownload(const char* url, std::string* error);
 // the name. See the dock's README.
 Status launch(const LaunchSpec& s, const Config& cfg, std::string* detail);
 
+// The same, with a plain shell in the column instead of a Claude Code session.
+Status launchShell(const fs::path& cwd, const Config& cfg, std::string* detail);
+
+// Would an ordinary launch go to a column right now?
+//
+// True when the setting allows it and Docked Console can be found, running or
+// not: a cold dock is started by the launch itself, so "installed" is the whole
+// test. Cache it rather than calling it per frame; it reads the registry.
+bool available(const Config& cfg);
+
 } // namespace pm::dock

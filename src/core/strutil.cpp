@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 
 namespace pm {
 
@@ -110,6 +111,29 @@ std::string toUpper(std::string_view s)
         return static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
     });
     return out;
+}
+
+std::string relativeAge(std::int64_t unixSeconds)
+{
+    if (unixSeconds <= 0)
+        return "-";
+
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+
+    // Clock skew and a commit dated in the future both land here. Clamping
+    // beats printing a negative age.
+    std::int64_t d = static_cast<std::int64_t>(now) - unixSeconds;
+    if (d < 0)
+        d = 0;
+
+    if (d < 60)          return std::to_string(d) + "s";
+    if (d < 3600)        return std::to_string(d / 60) + "m";
+    if (d < 86400)       return std::to_string(d / 3600) + "h";
+    if (d < 86400 * 30)  return std::to_string(d / 86400) + "d";
+    if (d < 86400 * 365) return std::to_string(d / (86400 * 30)) + "mo";
+    return std::to_string(d / (86400 * 365)) + "y";
 }
 
 } // namespace pm

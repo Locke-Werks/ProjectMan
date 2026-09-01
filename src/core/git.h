@@ -55,4 +55,38 @@ std::string ownerRepoFromUrl(std::string_view url);
 // Linked worktrees, counted from <gitdir>/worktrees. Zero processes.
 int countWorktrees(const fs::path& gitDir);
 
+// What actually changed in one repository, for the detail pane.
+struct ChangedFile {
+    std::string code;      // porcelain XY, "??" for untracked
+    std::string path;      // repo-relative, already unquoted
+    std::string label;     // "modified", "added", "untracked", ...
+    int         added   = 0;
+    int         removed = 0;
+    bool        binary  = false;
+    bool        staged  = false;
+};
+
+struct Commit {
+    std::string  shortOid;
+    std::string  subject;
+    std::string  author;
+    std::int64_t when = 0;
+};
+
+// Three git invocations, so this is fetched for the ONE selected repository
+// rather than during the sweep. Counting it into the sweep would multiply it by
+// the size of the tree for data nothing is looking at.
+struct RepoDetail {
+    std::vector<ChangedFile> files;
+    int                      filesTotal = 0;   // before the cap
+    int                      added      = 0;
+    int                      removed    = 0;
+    std::vector<Commit>      recent;
+    std::string              error;
+};
+
+// cap bounds the file list; filesTotal still reports the real count.
+RepoDetail detail(const fs::path& workdir, const RepoProbe& probe, int cap = 200,
+                  const ProbeOptions& opt = {});
+
 } // namespace pm::git

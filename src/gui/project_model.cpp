@@ -1,26 +1,11 @@
 #include "project_model.h"
 
+#include "strutil.h"
+
 #include <QDateTime>
 
 namespace pm::gui {
 namespace {
-
-QString relativeTime(std::int64_t unix)
-{
-    if (unix <= 0)
-        return QStringLiteral("-");
-
-    const qint64 now = QDateTime::currentSecsSinceEpoch();
-    qint64       d   = now - unix;
-    if (d < 0)
-        d = 0;
-
-    if (d < 3600)        return QStringLiteral("%1m").arg(d / 60);
-    if (d < 86400)       return QStringLiteral("%1h").arg(d / 3600);
-    if (d < 86400 * 30)  return QStringLiteral("%1d").arg(d / 86400);
-    if (d < 86400 * 365) return QStringLiteral("%1mo").arg(d / (86400 * 30));
-    return QStringLiteral("%1y").arg(d / (86400 * 365));
-}
 
 QString changesText(const GitStatus& g)
 {
@@ -125,7 +110,7 @@ QVariant ProjectModel::data(const QModelIndex& index, int role) const
     case ColChanges: return changesText(p->git);
     case ColSync:    return syncText(p->git);
     case ColOpen:    return p->open.total() ? QString::number(p->open.total()) : QString();
-    case ColLast:    return relativeTime(p->activityUnix());
+    case ColLast:    return QString::fromStdString(relativeAge(p->activityUnix()));
     default:         return {};
     }
 }

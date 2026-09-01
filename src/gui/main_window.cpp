@@ -6,6 +6,7 @@
 #include "launcher.h"
 #include "project_model.h"
 #include "scanner.h"
+#include "strutil.h"
 #include "theme_qt.h"
 #include "widgets.h"
 
@@ -122,6 +123,73 @@ void ScanController::onScanFinished(int probed, int failed, double wallSeconds)
     QMetaObject::invokeMethod(this, [this, probed, failed, wallSeconds] {
         emit sweepFinished(probed, failed, wallSeconds);
     }, Qt::QueuedConnection);
+}
+
+// ------------------------------------------------------------ DetailController
+
+DetailController::DetailController(QObject* parent) : QObject(parent)
+{
+    worker_ = std::thread(&DetailController::loop, this);
+}
+
+DetailController::~DetailController()
+{
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stop_ = true;
+    }
+    wake_.notify_all();
+    // Joined, not detached: the worker posts back to this object, so it must be
+    // finished before the object goes.
+    if (worker_.joinable())
+        worker_.join();
+}
+
+quint64 DetailController::request(const pm::fs::path& path, int timeoutMs)
+{
+    quint64 token = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pending_    = path;
+        timeoutMs_  = timeoutMs;
+        have_       = true;
+        token       = ++token_;
+    }
+    wake_.notify_one();
+    return token;
+}
+
+void DetailController::loop()
+{
+    for (;;) {
+        pm::fs::path path;
+        int          timeoutMs = 20000;
+        quint64      token     = 0;
+
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            wake_.wait(lock, [this] { return have_ || stop_; });
+            if (stop_)
+                return;
+            path      = pending_;
+            timeoutMs = timeoutMs_;
+            token     = token_;
+            have_     = false;
+        }
+
+        pm::git::ProbeOptions po;
+        po.timeoutMs = timeoutMs;
+
+        const pm::git::RepoProbe  probe = pm::git::probe(path);
+        const pm::git::RepoDetail d     = pm::git::detail(path, probe, 200, po);
+
+        // Emitted from inside the posted lambda, so the signal runs on the GUI
+        // thread as a direct call and RepoDetail never crosses as a queued
+        // argument needing a registered metatype.
+        QMetaObject::invokeMethod(this, [this, token, d] {
+            emit ready(token, d);
+        }, Qt::QueuedConnection);
+    }
 }
 
 // ------------------------------------------------------------- DispatchDialog
@@ -595,10 +663,15 @@ MainWindow::MainWindow(Config cfg, QWidget* parent)
     detailClaude_->setWordWrap(true);
     dl->addWidget(detailClaude_);
 
-    dl->addStretch(1);
+    inspect_ = new QPlainTextEdit;
+    inspect_->setReadOnly(true);
+    inspect_->setFont(theme::mono(11));
+    inspect_->setLineWrapMode(QPlainTextEdit::NoWrap);
+    inspect_->setFrameShape(QFrame::NoFrame);
+    inspect_->setPlaceholderText(QStringLiteral("Select a project."));
+    dl->addWidget(inspect_, 1);
 
     engage_      = new QPushButton(QStringLiteral("ENGAGE"));
-    dock_        = new QPushButton(QStringLiteral("DOCK"));
     settingsBtn_ = new QPushButton(QStringLiteral("SETTINGS"));
     resume_   = new QPushButton(QStringLiteral("CONTINUE"));
     sessions_ = new QPushButton(QStringLiteral("SESSIONS"));
@@ -607,7 +680,7 @@ MainWindow::MainWindow(Config cfg, QWidget* parent)
     engage_->setObjectName(QStringLiteral("Primary"));
 
     for (QPushButton* b : { engage_, resume_, sessions_, terminal_, dispatch_,
-                            dock_, settingsBtn_ })
+                            settingsBtn_ })
         b->setFont(theme::tracked(11, QFont::Bold, 0.14));
 
     dl->addWidget(engage_);
@@ -617,12 +690,16 @@ MainWindow::MainWindow(Config cfg, QWidget* parent)
     dl->addLayout(row2);
     auto* row3 = new QHBoxLayout;
     row3->addWidget(terminal_);
-    row3->addWidget(dock_);
+    row3->addWidget(dispatch_);
     dl->addLayout(row3);
-    auto* row4 = new QHBoxLayout;
-    row4->addWidget(dispatch_);
-    row4->addWidget(settingsBtn_);
-    dl->addLayout(row4);
+    dl->addWidget(settingsBtn_);
+
+    // Where a launch lands, and the only place the dock is named now that
+    // it is not a button. Reads as a statement of fact rather than an advert
+    // when it is missing.
+    dockNote_ = caption(QString(), kFg4);
+    dockNote_->setWordWrap(true);
+    dl->addWidget(dockNote_);
 
     split->addWidget(detail);
     split->setStretchFactor(0, 3);
@@ -632,6 +709,9 @@ MainWindow::MainWindow(Config cfg, QWidget* parent)
 
     grain_ = new GrainOverlay(central);
     grain_->raise();
+
+    detail_ = new DetailController(this);
+    connect(detail_, &DetailController::ready, this, &MainWindow::onDetailReady);
 
     scan_ = new ScanController(this);
     connect(scan_, &ScanController::rowReady, this, &MainWindow::onRowReady);
@@ -651,7 +731,6 @@ MainWindow::MainWindow(Config cfg, QWidget* parent)
     connect(sessions_, &QPushButton::clicked, this, [this] { launch(LaunchMode::Resume); });
     connect(terminal_, &QPushButton::clicked, this, &MainWindow::openTerminal);
     connect(dispatch_, &QPushButton::clicked, this, &MainWindow::openDispatch);
-    connect(dock_, &QPushButton::clicked, this, &MainWindow::openDock);
     connect(settingsBtn_, &QPushButton::clicked, this, &MainWindow::openSettings);
 
     // The same bindings as the console front end, so muscle memory carries
@@ -671,8 +750,8 @@ MainWindow::MainWindow(Config cfg, QWidget* parent)
                   [this] { openTerminal(); });
     new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_Comma), this,
                   [this] { openSettings(); });
-    new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_K), this, [this] { openDock(); });
 
+    refreshDockNote();
     onSelectionChanged();
     scan_->start(cfg_);
 }
@@ -728,7 +807,7 @@ void MainWindow::onSelectionChanged()
     const Project* p = current();
 
     const bool have = p != nullptr;
-    for (QPushButton* b : { engage_, resume_, sessions_, terminal_, dock_ })
+    for (QPushButton* b : { engage_, resume_, sessions_, terminal_ })
         b->setEnabled(have);
 
     if (!have) {
@@ -737,6 +816,8 @@ void MainWindow::onSelectionChanged()
         detailCommit_->clear();
         detailOpen_->clear();
         detailClaude_->clear();
+        inspect_->clear();
+        detailToken_ = 0;
         return;
     }
 
@@ -747,7 +828,7 @@ void MainWindow::onSelectionChanged()
                                 : QStringLiteral("\n") + QString::fromStdString(p->ownerRepo)));
 
     if (p->git.lastCommitUnix) {
-        detailCommit_->setText(QStringLiteral("%1 — %2")
+        detailCommit_->setText(QStringLiteral("%1: %2")
                                    .arg(QString::fromStdString(p->git.lastCommitAuthor))
                                    .arg(QString::fromStdString(p->git.lastCommitSubject)));
     } else if (!p->git.error.empty()) {
@@ -782,12 +863,77 @@ void MainWindow::onSelectionChanged()
     } else {
         detailClaude_->clear();
     }
+
+    // Off-thread: this is three git invocations, and arrowing down the list
+    // would otherwise hitch on every row.
+    if (p->kind == ProjectKind::Repo) {
+        inspect_->setPlainText(QStringLiteral("Reading..."));
+        detailToken_ = detail_->request(p->path, cfg_.probeTimeoutMs);
+    } else {
+        inspect_->clear();
+        detailToken_ = 0;
+    }
+}
+
+bool MainWindow::wantsLooseWindow()
+{
+    // Read at the moment of the click rather than from the event, so it works
+    // for the keyboard shortcuts as well as the buttons.
+    return (QApplication::keyboardModifiers() & Qt::ShiftModifier) != 0;
+}
+
+bool MainWindow::tryDock(const Project& p, LaunchMode mode, bool shell)
+{
+    if (!dockReady_ || wantsLooseWindow())
+        return false;
+
+    LaunchSpec s;
+    s.cwd  = p.path;
+    s.mode = mode;
+
+    // A cold dock can sit behind a UAC prompt for as long as the user takes to
+    // answer, so the button says what it is doing rather than freezing.
+    QPushButton* pressed = shell ? terminal_ : engage_;
+    const QString  was   = pressed->text();
+    pressed->setEnabled(false);
+    pressed->setText(QStringLiteral("DOCKING"));
+    QApplication::processEvents();
+
+    std::string        why;
+    const dock::Status st = shell ? dock::launchShell(p.path, cfg_, &why)
+                                  : dock::launch(s, cfg_, &why);
+
+    pressed->setText(was);
+    pressed->setEnabled(true);
+
+    if (st == dock::Status::Ok)
+        return true;
+
+    if (st == dock::Status::NotInstalled) {
+        // Only reachable if it was uninstalled since the note was drawn.
+        dockReady_ = false;
+        refreshDockNote();
+        offerDockDownload();
+        return false;
+    }
+
+    // Anything else is the dock being full or on its way out. Say so, then let
+    // the caller open a window: a refusal is not a reason to do nothing.
+    QString msg = QString::fromLatin1(dock::statusText(st));
+    if (!why.empty())
+        msg += QStringLiteral(":\n\n") + QString::fromStdString(why);
+    msg += QStringLiteral("\n\nOpening a window instead.");
+    QMessageBox::information(this, QStringLiteral("ProjectMan"), msg);
+    return false;
 }
 
 void MainWindow::launch(LaunchMode mode)
 {
     const Project* p = current();
     if (!p)
+        return;
+
+    if (tryDock(*p, mode, /*shell=*/false))
         return;
 
     LaunchSpec s;
@@ -803,6 +949,9 @@ void MainWindow::openTerminal()
 {
     const Project* p = current();
     if (!p)
+        return;
+
+    if (tryDock(*p, LaunchMode::New, /*shell=*/true))
         return;
 
     // A terminal with nothing attached. openInTerminal always appends
@@ -835,44 +984,95 @@ void MainWindow::openDispatch()
         QMessageBox::warning(this, QStringLiteral("ProjectMan"), QString::fromStdString(err));
 }
 
-void MainWindow::openDock()
+void MainWindow::onDetailReady(quint64 token, pm::git::RepoDetail d)
 {
-    const Project* p = current();
-    if (!p)
+    // A result for a row the user has already moved off is not wrong, it is
+    // late. Dropping it is the whole reason the token exists.
+    if (token != detailToken_)
         return;
 
-    LaunchSpec s;
-    s.cwd = p->path;
-
-    // Starting a cold dock can sit behind a UAC prompt for as long as the user
-    // takes to answer, so the button says what it is doing and stays disabled
-    // rather than freezing the window. Run on the GUI thread all the same: the
-    // work is one SendMessageTimeout plus polling, and threading it would mean
-    // marshalling the result back for a message box.
-    dock_->setEnabled(false);
-    dock_->setText(QStringLiteral("DOCKING"));
-    QApplication::processEvents();
-
-    std::string        detail;
-    const dock::Status st = dock::launch(s, cfg_, &detail);
-
-    dock_->setText(QStringLiteral("DOCK"));
-    dock_->setEnabled(true);
-
-    if (st == dock::Status::Ok)
-        return;
-
-    // Nothing to dock into is the one refusal a person can act on immediately,
-    // so it offers the installer rather than naming a URL to copy out by hand.
-    if (st == dock::Status::NotInstalled) {
-        offerDockDownload();
+    if (!d.error.empty()) {
+        inspect_->setPlainText(QString::fromStdString(d.error));
         return;
     }
 
-    QString msg = QString::fromLatin1(dock::statusText(st));
-    if (!detail.empty())
-        msg += QStringLiteral(":\n\n") + QString::fromStdString(detail);
-    QMessageBox::warning(this, QStringLiteral("ProjectMan"), msg);
+    QString out;
+
+    if (d.filesTotal == 0) {
+        out += QStringLiteral("CHANGES  working tree clean\n");
+    } else {
+        out += QStringLiteral("CHANGES  %1 file%2")
+                   .arg(d.filesTotal)
+                   .arg(d.filesTotal == 1 ? "" : "s");
+        if (d.added || d.removed) {
+            out += QStringLiteral("  +%1 -%2").arg(d.added).arg(d.removed);
+        }
+        out += QChar('\n');
+
+        // Widest path in the list, so the counts line up without pushing the
+        // short names miles from their own column.
+        int width = 0;
+        for (const git::ChangedFile& f : d.files)
+            width = std::max(width, static_cast<int>(f.path.size()));
+        width = std::min(width, 60);
+
+        for (const git::ChangedFile& f : d.files) {
+            QString path = QString::fromStdString(f.path);
+            if (path.size() > 60)
+                path = QStringLiteral("...") + path.right(57);
+
+            out += QStringLiteral("  %1  %2")
+                       .arg(QString::fromStdString(f.code), -2)
+                       .arg(path, -width);
+
+            if (f.binary)
+                out += QStringLiteral("  binary");
+            else if (f.added || f.removed)
+                out += QStringLiteral("  +%1 -%2").arg(f.added).arg(f.removed);
+            else
+                out += QStringLiteral("  ") + QString::fromStdString(f.label);
+
+            out += QChar('\n');
+        }
+
+        const int hidden = d.filesTotal - static_cast<int>(d.files.size());
+        if (hidden > 0)
+            out += QStringLiteral("  ... and %1 more\n").arg(hidden);
+    }
+
+    if (!d.recent.empty()) {
+        out += QStringLiteral("\nRECENT\n");
+        for (const git::Commit& c : d.recent) {
+            out += QStringLiteral("  %1  %2  %3\n")
+                       .arg(QString::fromStdString(c.shortOid), -8)
+                       .arg(QString::fromStdString(relativeAge(c.when)), -5)
+                       .arg(QString::fromStdString(c.subject));
+        }
+    }
+
+    inspect_->setPlainText(out);
+}
+
+void MainWindow::refreshDockNote()
+{
+    dockReady_ = dock::available(cfg_);
+
+    if (dockReady_) {
+        dockNote_->setText(
+            QStringLiteral("Launches into a Docked Console column. "
+                           "Hold Shift for a window of its own."));
+        return;
+    }
+
+    // Not an advert. It says what will happen, and names the thing that would
+    // change it, because a person who has never heard of Docked Console has no
+    // way to find out that the option exists.
+    dockNote_->setText(
+        cfg_.dockAuto
+            ? QStringLiteral("Launches open a new window. Docked Console, if you "
+                             "install it, holds them in a strip instead.")
+            : QStringLiteral("Launches open a new window. Turn on \"Use the dock\" "
+                             "in Settings to put them in a Docked Console column."));
 }
 
 void MainWindow::offerDockDownload()
@@ -928,6 +1128,10 @@ void MainWindow::openSettings()
                            || before.descendContainers != cfg_.descendContainers
                            || before.githubEnabled != cfg_.githubEnabled
                            || before.githubOwners != cfg_.githubOwners;
+    // dock.use_dock is one of the settings just edited, and the note under the
+    // buttons is drawn from it.
+    refreshDockNote();
+
     if (rescanNeeded)
         rescan();
     else

@@ -5,6 +5,23 @@ current terminal to Claude Code in the one you pick. `ProjectMan.exe` shows the
 same data as a desktop dashboard and launches into a new Windows Terminal
 window.
 
+New in 0.4.0: if [Docked Console](https://github.com/Locke-Werks/dockedconsole)
+is installed, that is where launches go. It is no longer a separate action: DOCK
+and `Ctrl+K` are gone, and ENGAGE, TERMINAL, `Enter`, `Ctrl+T`, `pm go` and
+`pm open` all land in a column. Without it they open an ordinary window exactly
+as before, and the button legend in each front end says which it will be. Hold
+Shift over a launch, or use `--window`, for a loose window on one launch;
+`dock.use_dock = false` turns it off entirely.
+
+A dock that is full now falls back to a window instead of refusing. As an
+explicit action a refusal was right, but as the default path it would leave a
+button doing nothing.
+
+The desktop detail pane grew a view of what actually changed: every modified
+file with its status and line counts, the diffstat total, and the last eight
+commits. It is fetched off the GUI thread, one repository at a time, so arrowing
+down the list does not spawn a git process per row.
+
 New in 0.3.0: general instructions on a dispatch. A free-text box above the item
 list scopes the run to one job across the selected repositories rather than
 working the items as found: "ensure every default branch is named main, and

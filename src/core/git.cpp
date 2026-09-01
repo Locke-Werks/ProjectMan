@@ -358,4 +358,171 @@ int countWorktrees(const fs::path& gitDir)
     return n;
 }
 
+namespace {
+
+// XY from porcelain v1. X is the index, Y is the work tree, and the work tree
+// wins for the label because it is the change a person has not dealt with yet.
+std::string statusLabel(std::string_view code)
+{
+    if (code == "??")
+        return "untracked";
+    if (code == "!!")
+        return "ignored";
+
+    const char x = code.size() > 0 ? code[0] : ' ';
+    const char y = code.size() > 1 ? code[1] : ' ';
+
+    // Both sides lettered with the same letter, or either side U, is a conflict.
+    if (x == 'U' || y == 'U' || (x == 'A' && y == 'A') || (x == 'D' && y == 'D'))
+        return "conflicted";
+
+    const char c = (y != ' ') ? y : x;
+    switch (c) {
+    case 'M': return "modified";
+    case 'A': return "added";
+    case 'D': return "deleted";
+    case 'R': return "renamed";
+    case 'C': return "copied";
+    case 'T': return "typechange";
+    default:  return "changed";
+    }
+}
+
+// porcelain v1 with -z: "XY<space><path>" per NUL-terminated record, and a
+// rename or copy carries its source path as the very next record. -z is used
+// rather than the default so no path is ever quoted or escaped, which is the
+// whole class of bug that eats non-ASCII and spaces.
+void parseStatusZ(std::string_view text, int cap, std::vector<ChangedFile>* out,
+                  int* total)
+{
+    std::vector<std::string_view> records;
+    size_t start = 0;
+    while (start <= text.size()) {
+        const size_t nul = text.find('\0', start);
+        if (nul == std::string_view::npos) {
+            if (start < text.size())
+                records.push_back(text.substr(start));
+            break;
+        }
+        records.push_back(text.substr(start, nul - start));
+        start = nul + 1;
+    }
+
+    for (size_t i = 0; i < records.size(); ++i) {
+        const std::string_view rec = records[i];
+        if (rec.size() < 4)
+            continue;
+
+        ChangedFile f;
+        f.code  = std::string(rec.substr(0, 2));
+        f.path  = std::string(rec.substr(3));
+        f.label = statusLabel(f.code);
+        f.staged = f.code[0] != ' ' && f.code != "??";
+
+        // The source of a rename or copy is its own record and is not a change
+        // in its own right.
+        if (f.code[0] == 'R' || f.code[0] == 'C')
+            ++i;
+
+        ++*total;
+        if (cap <= 0 || static_cast<int>(out->size()) < cap)
+            out->push_back(std::move(f));
+    }
+}
+
+} // namespace
+
+RepoDetail detail(const fs::path& workdir, const RepoProbe& p, int cap,
+                  const ProbeOptions& opt)
+{
+    RepoDetail d;
+
+    if (!p.isRepo || p.isBare)
+        return d;
+
+    const fs::path& git = exePath();
+    if (git.empty()) {
+        d.error = "git.exe not found";
+        return d;
+    }
+
+    const ProcResult st =
+        run(git, argsFor({ "status", "--porcelain", "-z" }), workdir, opt.timeoutMs);
+    if (!st.started || st.timedOut || st.exitCode != 0) {
+        d.error = st.started ? std::string(trim(st.err)) : st.launchError;
+        if (d.error.empty())
+            d.error = "git status failed";
+        return d;
+    }
+    parseStatusZ(st.out, cap, &d.files, &d.filesTotal);
+
+    // Line counts for tracked changes. Untracked files are absent from a diff
+    // by definition, so they keep their zeroes rather than being invented.
+    const ProcResult ns =
+        run(git, argsFor({ "diff", "--numstat", "HEAD" }), workdir, opt.timeoutMs);
+    if (ns.started && !ns.timedOut && ns.exitCode == 0) {
+        for (const std::string_view line : splitLines(ns.out)) {
+            const size_t t1 = line.find('\t');
+            if (t1 == std::string_view::npos)
+                continue;
+            const size_t t2 = line.find('\t', t1 + 1);
+            if (t2 == std::string_view::npos)
+                continue;
+
+            const std::string_view a  = line.substr(0, t1);
+            const std::string_view r  = line.substr(t1 + 1, t2 - t1 - 1);
+            const std::string      fp = std::string(line.substr(t2 + 1));
+
+            // "-" on both counts is git's way of saying binary.
+            const bool binary = (a == "-" || r == "-");
+            const int  added   = binary ? 0 : std::atoi(std::string(a).c_str());
+            const int  removed = binary ? 0 : std::atoi(std::string(r).c_str());
+
+            d.added   += added;
+            d.removed += removed;
+
+            for (ChangedFile& f : d.files) {
+                if (f.path == fp) {
+                    f.added   = added;
+                    f.removed = removed;
+                    f.binary  = binary;
+                    break;
+                }
+            }
+        }
+    }
+
+    const ProcResult lg =
+        run(git, argsFor({ "log", "-n", "8", "--format=%h%x1f%ct%x1f%an%x1f%s" }),
+            workdir, opt.timeoutMs);
+    if (lg.started && !lg.timedOut && lg.exitCode == 0) {
+        for (const std::string_view line : splitLines(lg.out)) {
+            // Unit separators, because a subject line can contain anything a
+            // person felt like typing, tabs and pipes included.
+            std::vector<std::string_view> f;
+            size_t start = 0;
+            for (;;) {
+                const size_t sep = line.find('\x1f', start);
+                if (sep == std::string_view::npos) {
+                    f.push_back(line.substr(start));
+                    break;
+                }
+                f.push_back(line.substr(start, sep - start));
+                start = sep + 1;
+            }
+            if (f.size() < 4)
+                continue;
+
+            Commit c;
+            c.shortOid = std::string(f[0]);
+            c.when     = std::atoll(std::string(f[1]).c_str());
+            c.author   = std::string(f[2]);
+            c.subject  = std::string(f[3]);
+            d.recent.push_back(std::move(c));
+        }
+    }
+
+    return d;
+}
+
 } // namespace pm::git

@@ -19,20 +19,30 @@ project in it, and launches Claude Code into the one you pick.
 
 Two front ends over one core.
 
-**`pm`** is a console picker. Selecting a project hands it *this* terminal, so
-Claude Code takes over the window you are already in. When it exits you are back
-at the list.
+**`pm`** is a console picker. **`ProjectMan.exe`** is the same data as a desktop
+dashboard.
 
-**`ProjectMan.exe`** is the same data as a desktop dashboard. Launching opens a
-new Windows Terminal window in the project directory.
+Where a launch lands depends on one thing: whether Docked Console is installed.
+With it, sessions go into a column of the dock and the list stays up. Without
+it, the console hands over *this* terminal and the desktop app opens a new
+Windows Terminal window.
 
 ## Docked
 
-DOCK, `Ctrl+K`, or `pm dock <name>` puts the session in a [Docked
-Console](https://github.com/Locke-Werks/dockedconsole) column instead of a
-window of its own. No dock running starts one; a column with room takes a
-horizontal split; a full column gets a new column. Three columns at their pane
-cap refuses and says so rather than falling back to a loose window.
+If [Docked Console](https://github.com/Locke-Werks/dockedconsole) is installed,
+launching puts the session in one of its columns instead of a window of its own.
+There is no separate action for it: ENGAGE, TERMINAL and `pm go` all land there,
+and the button legend says where a launch is going. Without it they open an
+ordinary window, exactly as before.
+
+No dock running starts one; a column with room takes a horizontal split; a full
+column gets a new column. Three columns at their pane cap falls back to a
+window rather than refusing, because the dock being full is not a reason for a
+launch to do nothing.
+
+Hold **Shift** over ENGAGE or TERMINAL, or press `Ctrl+Shift+T`, for a loose
+window on one launch. `pm go --window` and `pm open --window` are the same thing
+from a shell, and `dock.use_dock = false` turns the whole behaviour off.
 
 ProjectMan never runs `wt` for this: it sends the dock a request and the dock
 splits itself. Windows Terminal keeps elevated and unelevated windows in
@@ -40,8 +50,9 @@ separate worlds, and aiming `wt` at the wrong one does not fail, it makes a new
 window that permanently steals the name. The dock always splits from the token
 that owns the column.
 
-Needs Docked Console 0.4.0 or newer. An older one cannot take a pane and says
-so. If it is not installed at all, ProjectMan offers the download.
+Needs Docked Console 0.4.0 or newer, and 0.4.1 for TERMINAL, which asks for a
+plain shell rather than a command. An older one cannot take a pane and says so.
+If it is not installed at all, ProjectMan offers the download.
 
 ## Dispatch
 
@@ -74,9 +85,9 @@ dialog, or `pm dispatch --dry-run`.
 pm                          browse and launch
 pm ls [--dirty] [--repos] [--sort recent|name|dirty|open] [--json]
 pm status <name>            one project in detail
-pm go <name> [-c|-r]        hand this terminal to Claude Code there
-pm open <name>              open a new terminal window there
-pm dock <name>              put Claude Code in a Docked Console column
+pm go <name> [-c|-r] [--window]      launch Claude Code there
+pm open <name> [--window]            a plain shell there
+pm dock <name>                       the dock explicitly, never a window
 pm items [--json]           every outstanding item across the tree
 pm dispatch [--all] [--dry-run] [-i "<instructions>"]
 pm refresh                  refetch open pull requests and issues
@@ -100,11 +111,11 @@ Every action is Ctrl-modified, because bare letters go to the filter.
 | Key | |
 |---|---|
 | type | filter |
-| Enter | launch Claude Code |
+| Enter | launch Claude Code (into the dock when one is installed) |
 | Ctrl+R | continue the last conversation there |
 | Ctrl+E | pick a session to resume |
-| Ctrl+T | open a terminal window |
-| Ctrl+K | put it in a Docked Console column |
+| Ctrl+T | open a plain shell |
+| Shift+Enter, Ctrl+Shift+T | the same, in a loose window rather than the dock |
 | Ctrl+D | dispatch |
 | F2 | settings (Ctrl+, in the desktop app) |
 | F5 | rescan |
@@ -169,6 +180,9 @@ effort = "max"
 [dispatch]
 max_repos = 8
 max_items = 40
+
+[dock]
+use_dock = true   # false keeps every launch in a window of its own
 ```
 
 `scan.threads = 0` picks three quarters of the logical CPUs.

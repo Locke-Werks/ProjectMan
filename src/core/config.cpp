@@ -69,6 +69,7 @@ const std::set<std::string> kKnownKeys = {
     "github.owners",
     "github.cache_minutes",
     "dock.exe",
+    "dock.use_dock",
     "dock.start_timeout_ms",
     "dispatch.max_repos",
     "dispatch.max_items",
@@ -450,6 +451,7 @@ Config Config::load(ConfigStatus* status, std::string* detail)
         c.dockExe = fs::path(widen(*v));
     c.dockStartTimeoutMs =
         tbl["dock"]["start_timeout_ms"].value_or(c.dockStartTimeoutMs);
+    c.dockAuto = tbl["dock"]["use_dock"].value_or(c.dockAuto);
 
     c.dispatchMaxRepos = tbl["dispatch"]["max_repos"].value_or(c.dispatchMaxRepos);
     c.dispatchMaxItems = tbl["dispatch"]["max_items"].value_or(c.dispatchMaxItems);
@@ -555,7 +557,8 @@ bool Config::save(std::string* error) const
     os << "[dock]\n";
     if (!dockExe.empty())
         os << "exe = '" << dockExe.string() << "'\n";
-    os << "start_timeout_ms = " << dockStartTimeoutMs << "\n\n";
+    os << "start_timeout_ms = " << dockStartTimeoutMs << "\n";
+    os << "use_dock = " << (dockAuto ? "true" : "false") << "\n\n";
 
     os << "[dispatch]\n";
     os << "max_repos = " << dispatchMaxRepos << "\n";
@@ -632,6 +635,11 @@ const std::vector<Setting>& settings()
           "Path to dockedconsole.exe. Blank finds it.", SettingKind::Path,
           nullptr, 0, 0 },
 
+        { "dock.use_dock", "Use the dock",
+          "Launch into a Docked Console column whenever one can be found. "
+          "Hold Shift over a launch for a loose window.",
+          SettingKind::Bool, nullptr, 0, 0 },
+
         { "dock.start_timeout_ms", "Dock start wait",
           "Milliseconds to wait for a cold dock, which may sit behind a UAC prompt.",
           SettingKind::Int, nullptr, 5000, 180000 },
@@ -706,6 +714,7 @@ std::string readSetting(const Config& cfg, std::string_view key)
     if (iequals(key, "github.cache_minutes"))     return std::to_string(cfg.githubCacheMinutes);
     if (iequals(key, "dock.exe"))                 return cfg.dockExe.string();
     if (iequals(key, "dock.start_timeout_ms"))    return std::to_string(cfg.dockStartTimeoutMs);
+    if (iequals(key, "dock.use_dock"))            return cfg.dockAuto ? "true" : "false";
     if (iequals(key, "dispatch.max_repos"))       return std::to_string(cfg.dispatchMaxRepos);
     if (iequals(key, "dispatch.max_items"))       return std::to_string(cfg.dispatchMaxItems);
     if (iequals(key, "ui.sort"))                  return cfg.sort;
@@ -830,6 +839,13 @@ bool applySetting(Config& cfg, std::string_view key, std::string_view value,
         return asInt(1, 10080, &cfg.githubCacheMinutes) || fail("expected 1 to 10080");
     if (iequals(key, "dock.exe")) {
         cfg.dockExe = fs::path(widen(trim(value)));
+        return true;
+    }
+    if (iequals(key, "dock.use_dock")) {
+        bool b = false;
+        if (!parseBool(trim(value), &b))
+            return fail("expected true or false");
+        cfg.dockAuto = b;
         return true;
     }
     if (iequals(key, "dock.start_timeout_ms"))

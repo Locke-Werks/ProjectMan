@@ -1,6 +1,7 @@
 #pragma once
 
 #include "config.h"
+#include "git.h"
 #include "launcher.h"
 #include "model.h"
 #include "workitems.h"
@@ -9,6 +10,8 @@
 #include <QMainWindow>
 #include <QMetaType>
 
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 
 class QCheckBox;
@@ -60,6 +63,40 @@ private:
     std::thread      worker_;
     pm::CancelToken  token_;
     pm::ProjectList  projects_;
+};
+
+// Fetches the selected repository's changed files and recent commits.
+//
+// One long-lived worker with a single request slot, rather than a thread per
+// selection. Arrowing down a list would otherwise start a git process per row
+// and finish them out of order; here a newer request replaces an unstarted
+// older one, and a result that arrives after the selection moved on is dropped
+// by its token.
+class DetailController : public QObject {
+    Q_OBJECT
+
+public:
+    explicit DetailController(QObject* parent = nullptr);
+    ~DetailController() override;
+
+    // Returns the token to compare against in the ready handler.
+    quint64 request(const pm::fs::path& path, int timeoutMs);
+
+signals:
+    void ready(quint64 token, pm::git::RepoDetail detail);
+
+private:
+    void loop();
+
+    std::thread             worker_;
+    std::mutex              mutex_;
+    std::condition_variable wake_;
+
+    pm::fs::path pending_;
+    int          timeoutMs_ = 20000;
+    quint64      token_     = 0;
+    bool         have_      = false;
+    bool         stop_      = false;
 };
 
 // The per-item selection the user ticks before dispatching.
@@ -125,6 +162,7 @@ protected:
     void resizeEvent(QResizeEvent* e) override;
 
 private slots:
+    void onDetailReady(quint64 token, pm::git::RepoDetail detail);
     void onRowReady(int row, pm::Project project);
     void onSweepFinished(int probed, int failed, double seconds);
     void onSelectionChanged();
@@ -134,8 +172,17 @@ private:
     const Project* current() const;
     void launch(LaunchMode mode);
     void openTerminal();
-    void openDock();
     void offerDockDownload();
+
+    // Tries to put a launch in a dock column. False means the caller should do
+    // what it did before the dock existed: either the dock is not in play, or
+    // it refused and a refusal must not leave the button doing nothing.
+    bool tryDock(const Project& p, LaunchMode mode, bool shell);
+
+    // True when Shift is down, which forces a loose window for one launch.
+    static bool wantsLooseWindow();
+
+    void refreshDockNote();
     void openDispatch();
     void openSettings();
     void updateCounts();
@@ -163,8 +210,18 @@ private:
     QPushButton* sessions_ = nullptr;
     QPushButton* terminal_ = nullptr;
     QPushButton* dispatch_ = nullptr;
-    QPushButton* dock_     = nullptr;
     QPushButton* settingsBtn_ = nullptr;
+
+    QLabel* dockNote_ = nullptr;
+
+    // What actually changed in the selected repository, fetched off-thread.
+    QPlainTextEdit*    inspect_      = nullptr;
+    DetailController*  detail_       = nullptr;
+    quint64            detailToken_  = 0;
+
+    // Resolved once and after a settings change: dock::available reads the
+    // registry, and the note under the buttons is drawn from it.
+    bool dockReady_ = false;
 };
 
 } // namespace pm::gui

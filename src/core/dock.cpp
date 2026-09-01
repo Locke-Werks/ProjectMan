@@ -320,23 +320,19 @@ fs::path resolveExe(const Config& cfg)
     return {};
 }
 
-Status launch(const LaunchSpec& s, const Config& cfg, std::string* detail)
+bool available(const Config& cfg)
 {
-    std::error_code ec;
+    return cfg.dockAuto && !resolveExe(cfg).empty();
+}
 
-    const fs::path claude = cfg.resolveClaude();
-    if (claude.empty() || !fs::exists(claude, ec)) {
-        if (detail)
-            *detail = claude.string();
-        return Status::NoClaude;
-    }
+namespace {
 
-    // Built before the dock is started, because a cold start passes it on the
-    // command line as well as sending it as a request.
-    std::wstring command = widen(quoteArg(claude.string()));
-    for (const std::string& a : claudeArgs(s, cfg))
-        command += L" " + widen(quoteArg(a));
-
+// The whole of a dock launch once the command line is decided. An empty command
+// means a pane running the profile's own shell in cwd, which is what TERMINAL
+// wants; the dock takes that as a request in its own right.
+Status launchCommand(const fs::path& cwd, const std::wstring& command,
+                     const Config& cfg, std::string* detail)
+{
     HWND host = findHost();
 
     if (!host) {
@@ -352,14 +348,16 @@ Status launch(const LaunchSpec& s, const Config& cfg, std::string* detail)
         // exits within milliseconds while a UAC prompt the user has not
         // answered yet stands between us and the window. Polling for the
         // window is the only honest wait.
+        //
         // The dock always gives a new column its own shell, so without this the
         // very first column would be a shell with the requested session in a
         // pane underneath it. Telling it up front makes the column be the thing
         // that was asked for.
-        const std::vector<std::wstring> startArgs = {
-            L"--pane-dir", s.cwd.wstring(),
-            L"--pane-run", command,
-        };
+        std::vector<std::wstring> startArgs = { L"--pane-dir", cwd.wstring() };
+        if (!command.empty()) {
+            startArgs.push_back(L"--pane-run");
+            startArgs.push_back(command);
+        }
 
         if (!spawnDetached(exe, startArgs, detail))
             return Status::StartFailed;
@@ -378,7 +376,36 @@ Status launch(const LaunchSpec& s, const Config& cfg, std::string* detail)
         return Status::Ok;
     }
 
-    return fromSplitResult(sendRequest(host, s.cwd.wstring(), command));
+    return fromSplitResult(sendRequest(host, cwd.wstring(), command));
+}
+
+} // namespace
+
+Status launchShell(const fs::path& cwd, const Config& cfg, std::string* detail)
+{
+    // Empty command: the dock gives a new column its own shell, and an empty
+    // --pane-run leaves that alone rather than replacing it with nothing.
+    return launchCommand(cwd, std::wstring(), cfg, detail);
+}
+
+Status launch(const LaunchSpec& s, const Config& cfg, std::string* detail)
+{
+    std::error_code ec;
+
+    const fs::path claude = cfg.resolveClaude();
+    if (claude.empty() || !fs::exists(claude, ec)) {
+        if (detail)
+            *detail = claude.string();
+        return Status::NoClaude;
+    }
+
+    // Built before the dock is started, because a cold start passes it on the
+    // command line as well as sending it as a request.
+    std::wstring command = widen(quoteArg(claude.string()));
+    for (const std::string& a : claudeArgs(s, cfg))
+        command += L" " + widen(quoteArg(a));
+
+    return launchCommand(s.cwd, command, cfg, detail);
 }
 
 } // namespace pm::dock
