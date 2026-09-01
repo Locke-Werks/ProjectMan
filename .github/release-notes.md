@@ -5,6 +5,20 @@ current terminal to Claude Code in the one you pick. `ProjectMan.exe` shows the
 same data as a desktop dashboard and launches into a new Windows Terminal
 window.
 
+New in 0.5.0: **ProjectMan MCP**, a second product with its own installer,
+`ProjectMan-MCP-Setup.exe`. It is an stdio MCP server exposing exactly one tool,
+`get-projects`, which returns every project under the projects root with its git
+state and outstanding work as one JSON object. It reports and does nothing else:
+no launching, no dispatching, no writing, and it never creates a config.
+
+That is why it requires ProjectMan. The server reads `projectman.toml` for the
+projects root and the scan settings and will not invent one, so its installer
+checks for ProjectMan and refuses rather than guessing. Register it with
+`claude mcp add projectman -- pm-mcp`.
+
+ProjectMan neither installs nor offers it. The two ship from one tag and share a
+version number; installing either has no effect on the other.
+
 New in 0.4.0: if [Docked Console](https://github.com/Locke-Werks/dockedconsole)
 is installed, that is where launches go. It is no longer a separate action: DOCK
 and `Ctrl+K` are gone, and ENGAGE, TERMINAL, `Enter`, `Ctrl+T`, `pm go` and

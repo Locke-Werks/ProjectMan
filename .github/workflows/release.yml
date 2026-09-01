@@ -27,12 +27,14 @@ jobs:
         run: |
           $tag   = "${{ github.ref_name }}" -replace '^v', ''
           $toml  = (Select-String -Path installer.toml -Pattern '^\s*version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          $mcp   = (Select-String -Path installer-mcp.toml -Pattern '^\s*version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
           $major = (Select-String -Path cmake/Version.cmake -Pattern 'PM_VERSION_MAJOR (\d+)').Matches[0].Groups[1].Value
           $minor = (Select-String -Path cmake/Version.cmake -Pattern 'PM_VERSION_MINOR (\d+)').Matches[0].Groups[1].Value
           $patch = (Select-String -Path cmake/Version.cmake -Pattern 'PM_VERSION_PATCH (\d+)').Matches[0].Groups[1].Value
           $cmake = "$major.$minor.$patch"
-          "tag=$tag  installer.toml=$toml  Version.cmake=$cmake"
+          "tag=$tag  installer.toml=$toml  installer-mcp.toml=$mcp  Version.cmake=$cmake"
           if ($tag -ne $toml)  { throw "tag $tag does not match installer.toml $toml" }
+          if ($tag -ne $mcp)   { throw "tag $tag does not match installer-mcp.toml $mcp" }
           if ($tag -ne $cmake) { throw "tag $tag does not match cmake/Version.cmake $cmake" }
 
       - name: Install Qt ${{ env.QT_VERSION }}
@@ -92,15 +94,26 @@ jobs:
       # Certificates are valid three days, so the timestamp is what keeps a
       # signature valid past that. An untimestamped signature would verify today
       # and fail next week.
+      # Copied back by the path each came from, not into a fixed directory:
+      # there are two payloads now, and pm-mcp.exe belongs only to one of them.
       - name: Verify the payload signatures and copy them back
         shell: pwsh
         run: |
+          $origins = @{}
+          Get-Content build/payload-ours.txt |
+            Where-Object { $_ -and $_.Trim() } |
+            ForEach-Object { $origins[(Split-Path $_ -Leaf)] = $_ }
+
           foreach ($f in Get-ChildItem build/tosign -Filter *.exe) {
             $sig = Get-AuthenticodeSignature $f.FullName
             "$($f.Name) : $($sig.Status)  $($sig.SignerCertificate.Subject)"
             if ($sig.Status -ne 'Valid') { throw "$($f.Name) is $($sig.Status)" }
             if (-not $sig.TimeStamperCertificate) { throw "$($f.Name) is not timestamped" }
-            Copy-Item $f.FullName (Join-Path 'stage' $f.Name) -Force
+
+            $target = $origins[$f.Name]
+            if (-not $target) { throw "$($f.Name) has no recorded payload path" }
+            Copy-Item $f.FullName $target -Force
+            "  -> $target"
           }
 
       - name: Fetch Forge
@@ -118,7 +131,7 @@ jobs:
 
       # No --sign here. That flag shells out to scripts/sign.ps1 resolved against
       # the working directory, which only exists inside the Forge repo.
-      - name: Forge the installer
+      - name: Forge the installers
         shell: pwsh
         run: |
           ./tools/lwforge.exe build `
@@ -126,6 +139,14 @@ jobs:
             --payload stage `
             --stub tools/lwstub.exe `
             --out dist/ProjectMan-Setup.exe
+          if ($LASTEXITCODE -ne 0) { throw 'forging ProjectMan failed' }
+
+          ./tools/lwforge.exe build `
+            --config installer-mcp.toml `
+            --payload stage-mcp `
+            --stub tools/lwstub.exe `
+            --out dist/ProjectMan-MCP-Setup.exe
+          if ($LASTEXITCODE -ne 0) { throw 'forging ProjectMan MCP failed' }
 
       # Signed last, after resource stamping and the container append have
       # rewritten the image.
@@ -144,36 +165,48 @@ jobs:
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
 
-      - name: Verify the installer
+      - name: Verify the installers
         shell: pwsh
         run: |
-          $sig = Get-AuthenticodeSignature dist/ProjectMan-Setup.exe
-          "installer: $($sig.Status)  $($sig.SignerCertificate.Subject)"
-          if ($sig.Status -ne 'Valid') { throw "installer is $($sig.Status)" }
+          foreach ($name in 'ProjectMan-Setup.exe', 'ProjectMan-MCP-Setup.exe') {
+            $path = "dist/$name"
+            $sig  = Get-AuthenticodeSignature $path
+            "${name}: $($sig.Status)  $($sig.SignerCertificate.Subject)"
+            if ($sig.Status -ne 'Valid') { throw "$name is $($sig.Status)" }
 
-          # Signing appended a certificate table after the container. This
-          # proves it did not orphan the payload.
-          ./tools/lwforge.exe inspect dist/ProjectMan-Setup.exe
-          if ($LASTEXITCODE -ne 0) { throw 'the signed installer cannot read its own container' }
+            # Signing appended a certificate table after the container. This
+            # proves it did not orphan the payload.
+            ./tools/lwforge.exe inspect $path
+            if ($LASTEXITCODE -ne 0) { throw "$name cannot read its own container" }
+          }
 
       - name: Verify the option surface
         shell: pwsh
         run: |
-          $report = & dist/ProjectMan-Setup.exe --check-only /O:add_to_path=on /O:start_menu=off 2>&1 | Out-String
-          $code = $LASTEXITCODE
-          $report
+          $cases = @(
+            @{ exe = 'dist/ProjectMan-Setup.exe';     args = @('/O:add_to_path=on', '/O:start_menu=off') },
+            @{ exe = 'dist/ProjectMan-MCP-Setup.exe'; args = @('/O:add_to_path=on') }
+          )
 
-          # An option id the installer does not declare is a real defect.
-          if ($report -match 'not declared|does not declare|unknown option') {
-            throw "the installer rejected an option id it is supposed to declare`n$report"
-          }
+          foreach ($case in $cases) {
+            "== $($case.exe) =="
+            $report = & $case.exe --check-only @($case.args) 2>&1 | Out-String
+            $code = $LASTEXITCODE
+            $report
 
-          # Any other non-zero here is the runner failing one of our preflights,
-          # which is a property of the runner rather than a defect in the
-          # installer. The os_build floor is Windows 11 and hosted runners are
-          # often Server builds.
-          if ($code -ne 0) {
-            Write-Host "::warning::--check-only exited $code, which is expected when the runner itself fails a preflight"
+            # An option id the installer does not declare is a real defect.
+            if ($report -match 'not declared|does not declare|unknown option') {
+              throw "$($case.exe) rejected an option id it is supposed to declare`n$report"
+            }
+
+            # Any other non-zero here is the runner failing one of our
+            # preflights, which is a property of the runner rather than a defect
+            # in the installer. The os_build floor is Windows 11 and hosted
+            # runners are often Server builds, and the MCP installer also
+            # requires ProjectMan, which is not installed on a runner at all.
+            if ($code -ne 0) {
+              Write-Host "::warning::$($case.exe) --check-only exited $code, which is expected when the runner itself fails a preflight"
+            }
           }
 
       - name: Publish
@@ -181,6 +214,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}" dist/ProjectMan-Setup.exe `
+          gh release create "${{ github.ref_name }}" `
+            dist/ProjectMan-Setup.exe `
+            dist/ProjectMan-MCP-Setup.exe `
             --title "ProjectMan ${{ github.ref_name }}" `
             --notes-file .github/release-notes.md

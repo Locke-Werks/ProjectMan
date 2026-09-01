@@ -1,0 +1,90 @@
+# Forge installer configuration for ProjectMan MCP, which is its own product
+# with its own ARP entry, its own install directory and its own uninstall.
+# Schema: Locke-Werks/Forge docs/config-schema.md
+#
+# Paths use literal strings so a backslash stays a backslash. A TOML basic string
+# would read "\b" in "{InstallDir}\bin" as a backspace.
+
+[product]
+name         = "ProjectMan MCP"
+version      = "0.5.0"
+publisher    = "Locke Werks"
+description  = "An MCP server that reports your projects tree"
+copyright    = "Copyright (C) 2026 Locke Werks"
+url          = "https://github.com/Locke-Werks/ProjectMan"
+icon         = "assets/projectman-mcp.ico"
+# Its own, and stable across versions. Sharing ProjectMan's would make each
+# product's installer treat the other as an older copy of itself.
+upgrade_code = "01a2f259-8dec-49da-8ec2-e8273b2fdd35"
+aumid        = "LockeWerks.ProjectManMcp"
+
+[install]
+scope     = "machine"
+dir       = '{ProgramFiles}\Locke Werks\ProjectMan MCP'
+elevation = "required"
+
+[ui]
+license_text = """
+ProjectMan MCP
+Copyright (C) 2026 Locke Werks
+
+This program is free software: you can redistribute it and/or modify it under the
+terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with this
+program. If not, see <https://www.gnu.org/licenses/>.
+
+The complete source is at https://github.com/Locke-Werks/ProjectMan
+"""
+
+# The whole reason this is a separate installer rather than an option inside
+# ProjectMan's. The server reads ProjectMan's config and deliberately never
+# creates one: without ProjectMan there is no projects root to report on, and
+# inventing one would be worse than refusing. Forge writes this key from
+# [product].name, so it is ProjectMan's ARP entry by construction.
+[[preflight]]
+type = "registry_value"
+hive = "HKLM"
+key  = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\ProjectMan'
+fail = "ProjectMan is not installed. The MCP server reads ProjectMan's configuration and cannot create one, so install ProjectMan first."
+
+[[preflight]]
+type = "os_build"
+min  = 22000
+fail = "ProjectMan MCP needs Windows 11 or newer."
+
+# It cannot be overwritten while an MCP client is holding it open.
+[[preflight]]
+type            = "process_not_running"
+name            = "pm-mcp.exe"
+restart_manager = true
+fail            = "pm-mcp is running. Quit the MCP client using it, or disable the server, and try again."
+
+# 10 MB. One small binary with no runtime beside it, plus room for the
+# installer's own extraction.
+[[preflight]]
+type  = "free_disk_space"
+bytes = 10485760
+fail  = "ProjectMan MCP needs about 10 MB free on the install volume."
+
+# No Start Menu shortcut. This is a stdio server: a shortcut would start a
+# process that immediately blocks reading a console nobody is writing to.
+[[options]]
+id      = "add_to_path"
+label   = "Put pm-mcp on PATH"
+detail  = "Adds the install directory to the system PATH so an MCP client can be pointed at `pm-mcp` rather than a full path."
+default = true
+
+[[actions]]
+type  = "path_append"
+value = '{InstallDir}'
+when  = "add_to_path"
+
+[[actions]]
+type = "arp"

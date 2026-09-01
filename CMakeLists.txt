@@ -26,6 +26,7 @@ option(PM_WERROR    "Treat warnings as errors"                           OFF)
 option(PM_HARDENING "Apply exploit-mitigation compiler and linker flags"  ON)
 option(PM_BUILD_GUI "Build ProjectMan.exe, the Qt desktop dashboard"      ON)
 option(PM_BUILD_CLI "Build pm.exe, the console picker"                    ON)
+option(PM_BUILD_MCP "Build pm-mcp.exe, the MCP server, a separate product" ON)
 
 include(Dependencies)
 include(Warnings)
@@ -66,7 +67,18 @@ set(PM_MANIFEST    "${CMAKE_CURRENT_SOURCE_DIR}/app.manifest")
 
 # Configure the shared VERSIONINFO template once per binary. The three name
 # fields differ; every version field comes from cmake/Version.cmake.
+#
+# Two optional trailing arguments override the icon and the product name, for a
+# binary in this tree that is a separate product rather than part of ProjectMan.
+# Omitted, they resolve to ProjectMan's, so the two front ends are unaffected.
 function(pm_configure_rc out_var internal_name original_filename description)
+    if(ARGC GREATER 4)
+        set(PM_ICON_PATH "${ARGV4}")
+    endif()
+    if(ARGC GREATER 5)
+        set(PM_PRODUCT "${ARGV5}")
+    endif()
+
     set(PM_RC_INTERNAL_NAME     "${internal_name}")
     set(PM_RC_ORIGINAL_FILENAME "${original_filename}")
     set(PM_RC_DESCRIPTION       "${description}")
@@ -89,6 +101,10 @@ if(PM_BUILD_GUI)
     add_subdirectory(src/gui)
 endif()
 
+if(PM_BUILD_MCP)
+    add_subdirectory(src/mcp)
+endif()
+
 message(STATUS "")
 message(STATUS "ProjectMan ${PM_VERSION}")
 if(PM_BUILD_GUI)
@@ -96,5 +112,6 @@ if(PM_BUILD_GUI)
 endif()
 message(STATUS "  CLI       : ${PM_BUILD_CLI}")
 message(STATUS "  GUI       : ${PM_BUILD_GUI}")
+message(STATUS "  MCP       : ${PM_BUILD_MCP}")
 message(STATUS "  hardening : ${PM_HARDENING}  werror: ${PM_WERROR}")
 message(STATUS "")

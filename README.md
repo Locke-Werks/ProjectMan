@@ -54,6 +54,36 @@ Needs Docked Console 0.4.0 or newer, and 0.4.1 for TERMINAL, which asks for a
 plain shell rather than a command. An older one cannot take a pane and says so.
 If it is not installed at all, ProjectMan offers the download.
 
+## ProjectMan MCP
+
+A second product in this repository, shipped as its own installer: an stdio
+[MCP](https://modelcontextprotocol.io) server exposing exactly one tool.
+
+```
+get-projects   every project under the root, with its git state and open work
+```
+
+It reports and nothing else. No launching, no dispatching, no writing, and it
+never creates a config. That last part is why it requires ProjectMan: it reads
+`projectman.toml` to learn the projects root and the scan settings, and without
+one there is nothing to report on. Its installer checks for ProjectMan and
+refuses rather than guessing a root. Asked for projects with no config present,
+the tool answers with an error saying so.
+
+The result is one JSON object: the root, a scan timestamp, totals, and a
+`projects` array carrying each project's path, kind, origin, full git state
+(branch, upstream, ahead/behind, staged, unstaged, untracked, conflicted,
+stashes, last commit) and everything the front ends count as outstanding.
+
+Registering it with Claude Code, once the installer has put it on PATH:
+
+```
+claude mcp add projectman -- pm-mcp
+```
+
+ProjectMan itself neither installs nor offers this. The two are released
+together and versioned together, but installing one has no effect on the other.
+
 ## Dispatch
 
 When work is outstanding in several repositories at once, `pm dispatch` (or
