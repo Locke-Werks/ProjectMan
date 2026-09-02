@@ -5,6 +5,23 @@ current terminal to Claude Code in the one you pick. `ProjectMan.exe` shows the
 same data as a desktop dashboard and launches into a new Windows Terminal
 window.
 
+New in 0.6.0: **dispatch runs inside ProjectMan.** GO no longer opens a terminal
+with an interactive session in it; it runs `claude -p` with the briefing on
+stdin and shows the session's event stream as it arrives, in a run window on the
+desktop and as plain lines on the console. Each tool call is one line, errors
+are shown, the run ends with its duration, turn count and cost (labelled as an
+API-rate equivalent when the session runs on a subscription), and STOP (or
+Ctrl+C) takes down the session and everything it started. CONTINUE resumes the
+same session interactively, in the dock when there is one, with the same
+repositories.
+
+Fixed in 0.6.0: a dispatched session started idle, with nothing to do. Claude
+Code's `--add-dir` takes every following bare argument as another directory,
+and the briefing came right after the last one, so the session read it as a
+path and waited for a prompt that never came. The briefing no longer travels on
+the command line at all, and an interactive launch that does carry a prompt now
+puts `--` in front of it.
+
 New in 0.5.0: **ProjectMan MCP**, a second product with its own installer,
 `ProjectMan-MCP-Setup.exe`. It is an stdio MCP server exposing exactly one tool,
 `get-projects`, which returns every project under the projects root with its git
