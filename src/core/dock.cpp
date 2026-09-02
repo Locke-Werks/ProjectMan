@@ -61,6 +61,30 @@ BOOL CALLBACK countColumn(HWND child, LPARAM param)
     return TRUE;
 }
 
+constexpr wchar_t kTerminalClass[] = L"CASCADIA_HOSTING_WINDOW_CLASS";
+
+BOOL CALLBACK findTerminal(HWND child, LPARAM param)
+{
+    wchar_t cls[64] = {};
+    if (GetClassNameW(child, cls, static_cast<int>(std::size(cls)))
+        && wcscmp(cls, kTerminalClass) == 0) {
+        *reinterpret_cast<bool*>(param) = true;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+// True once a Windows Terminal window sits inside one of the host's columns.
+// Enumerated by class name rather than FindWindowExW, which does not match a
+// class registered by another process's packaged app even though the window
+// is right there under the column.
+bool hostHasEmbeddedTerminal(HWND host)
+{
+    bool found = false;
+    EnumChildWindows(host, findTerminal, reinterpret_cast<LPARAM>(&found));
+    return found;
+}
+
 bool processElevated(DWORD pid)
 {
     HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
@@ -224,8 +248,10 @@ const char* statusText(Status s)
                "https://github.com/Locke-Werks/dockedconsole/releases/latest, "
                "or set dock.exe in the config if it is somewhere unusual";
     case Status::StartFailed:
-        return "Docked Console was started and no dock appeared. If it asked for "
-               "administrator rights and the prompt was declined, it did not start";
+        return "Docked Console was started and no dock came up. If it asked for "
+               "administrator rights and the prompt was declined, it did not start; "
+               "otherwise %LOCALAPPDATA%\\DockedConsole\\dockedconsole.log says what "
+               "happened";
     case Status::NotHandled:
         return "Docked Console is running and did not answer. It is either "
                "shutting down, or is older than 0.4.0 and cannot take a pane";
@@ -362,18 +388,31 @@ Status launchCommand(const fs::path& cwd, const std::wstring& command,
         if (!spawnDetached(exe, startArgs, detail))
             return Status::StartFailed;
 
+        // The host window appears before the first column's terminal is
+        // embedded, and an embed that fails takes the dock down again a few
+        // seconds later. "Docked" means a terminal is really in a column, so
+        // that is what is waited for. The host is looked up afresh each time:
+        // a dock that relaunches itself elevated creates a new one.
         const auto deadline = std::chrono::steady_clock::now()
                             + std::chrono::milliseconds(cfg.dockStartTimeoutMs);
-        while (!host && std::chrono::steady_clock::now() < deadline) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        bool seenHost = false;
+        for (;;) {
             host = findHost();
+            if (host) {
+                seenHost = true;
+                if (hostHasEmbeddedTerminal(host))
+                    return Status::Ok;
+            } else if (seenHost) {
+                // It came up and went away again: an embed failure. The dock
+                // has already said why in its log and on screen.
+                if (detail)
+                    *detail = "the dock started and then undocked";
+                return Status::StartFailed;
+            }
+            if (std::chrono::steady_clock::now() >= deadline)
+                return Status::StartFailed;
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
-        if (!host)
-            return Status::StartFailed;
-
-        // The dock started with the session already in its first column. Sending
-        // the request as well would put a second copy in a pane beneath it.
-        return Status::Ok;
     }
 
     return fromSplitResult(sendRequest(host, cwd.wstring(), command));
