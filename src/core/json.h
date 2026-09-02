@@ -6,7 +6,7 @@
 #include <utility>
 #include <vector>
 
-namespace pm::mcp::json {
+namespace pm::json {
 
 // A JSON value, held as plain members rather than a variant.
 //
@@ -56,4 +56,4 @@ bool parse(std::string_view text, Value* out, std::string* error);
 // Compact, no spaces, no trailing newline.
 std::string dump(const Value& v);
 
-} // namespace pm::mcp::json
+} // namespace pm::json

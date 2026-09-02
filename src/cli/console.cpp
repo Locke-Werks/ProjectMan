@@ -5,12 +5,23 @@
 
 #include <windows.h>
 
+#include <atomic>
+#include <cstdio>
+#include <mutex>
+
 namespace pm::cli {
 namespace {
 
 // The single live session, so the console control handler can restore state
 // when the window is closed out from under us.
 ConsoleSession* g_session = nullptr;
+
+// The run Ctrl+C should stop, while there is one. A dispatch child has no
+// console of its own, so the event never reaches it; pm raises the token and
+// the runner takes the child down.
+std::atomic<CancelToken*> g_interrupt{ nullptr };
+
+std::mutex g_printGate;
 
 BOOL WINAPI ctrlHandler(DWORD type)
 {
@@ -27,7 +38,13 @@ BOOL WINAPI ctrlHandler(DWORD type)
         // TRUE). That form sets an "ignore Ctrl+C" process attribute which
         // CreateProcessW INHERITS, leaving the child structurally incapable of
         // ever receiving Ctrl+C.
-        return childLive() ? TRUE : FALSE;
+        if (childLive())
+            return TRUE;
+        if (CancelToken* token = g_interrupt.load(std::memory_order_acquire)) {
+            token->request_stop();
+            return TRUE;
+        }
+        return FALSE;
 
     case CTRL_CLOSE_EVENT:
     case CTRL_LOGOFF_EVENT:
@@ -51,6 +68,71 @@ bool stdinIsConsole()
 
     DWORD mode = 0;
     return GetConsoleMode(in, &mode) != 0;
+}
+
+void installInterruptHandler()
+{
+    // Registered once. A second registration of the same handler would have
+    // it called twice per event.
+    static const bool installed = SetConsoleCtrlHandler(&ctrlHandler, TRUE) != 0;
+    (void)installed;
+}
+
+void setInterruptTarget(CancelToken* token)
+{
+    g_interrupt.store(token, std::memory_order_release);
+}
+
+void printLine(std::string_view utf8)
+{
+    std::lock_guard<std::mutex> lock(g_printGate);
+
+    const HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD        mode = 0;
+    if (out && out != INVALID_HANDLE_VALUE && GetConsoleMode(out, &mode)) {
+        std::wstring line = widen(utf8);
+        line += L"\r\n";
+        DWORD written = 0;
+        WriteConsoleW(out, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
+        return;
+    }
+
+    std::string line(utf8);
+    line.push_back('\n');
+    std::fwrite(line.data(), 1, line.size(), stdout);
+    std::fflush(stdout);
+}
+
+void waitForKey(std::string_view prompt)
+{
+    if (!stdinIsConsole())
+        return;
+
+    printLine(prompt);
+
+    const HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD saved = 0;
+    GetConsoleMode(in, &saved);
+    SetConsoleMode(in, saved & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT));
+    FlushConsoleInputBuffer(in);
+
+    for (;;) {
+        INPUT_RECORD record{};
+        DWORD        got = 0;
+        if (!ReadConsoleInputW(in, &record, 1, &got) || got == 0)
+            break;
+        if (record.EventType != KEY_EVENT || !record.Event.KeyEvent.bKeyDown)
+            continue;
+        // A modifier on its own is not a key press anyone meant.
+        const WORD vk = record.Event.KeyEvent.wVirtualKeyCode;
+        if (vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU || vk == VK_LWIN
+            || vk == VK_RWIN || vk == VK_CAPITAL) {
+            continue;
+        }
+        break;
+    }
+
+    SetConsoleMode(in, saved);
 }
 
 ConsoleSession::ConsoleSession() { g_session = this; }
@@ -84,7 +166,7 @@ bool ConsoleSession::acquire()
         savedCursorSize_    = ci.dwSize;
     }
 
-    SetConsoleCtrlHandler(&ctrlHandler, TRUE);
+    installInterruptHandler();
     haveState_ = true;
     return true;
 }

@@ -1,6 +1,7 @@
 #include "config.h"
 #include "console.h"
 #include "discovery.h"
+#include "dispatch_console.h"
 #include "dock.h"
 #include "enrich.h"
 #include "git.h"
@@ -82,7 +83,7 @@ void printUsage()
         "  pm open <name>              open a plain terminal there\n"
         "  pm dock <name>              put Claude Code in a Docked Console column\n"
         "  pm items [--json]           every outstanding item across the tree\n"
-        "  pm dispatch [options]       run one Claude Code session across repos\n"
+        "  pm dispatch [options]       run claude -p across repos, output here\n"
         "  pm refresh                  refetch open pull requests and issues\n"
         "  pm doctor                   resolve git, claude and wt, and time a sweep\n"
         "  pm config [show|get|set]    read or change settings\n"
@@ -489,15 +490,15 @@ int main(int argc, char** argv)
         }
         std::printf("\n  %s: %s\n", autonomyLabel(cfg.autonomy),
                     autonomySummary(cfg.autonomy));
-        std::printf("  launch: claude %s\n",
-                    [&] {
-                        std::string line;
-                        LaunchSpec s;
-                        for (const std::string& arg : claudeArgs(s, cfg))
-                            line += arg + " ";
-                        return line;
-                    }()
-                        .c_str());
+        const auto joined = [&](const std::vector<std::string>& args) {
+            std::string line;
+            for (const std::string& arg : args)
+                line += arg + " ";
+            return line;
+        };
+        LaunchSpec s;
+        std::printf("  launch:   claude %s\n", joined(claudeArgs(s, cfg)).c_str());
+        std::printf("  dispatch: claude %s\n", joined(claudePrintArgs(s, cfg)).c_str());
         return kOk;
     }
 
@@ -630,30 +631,39 @@ int main(int argc, char** argv)
             std::vector<Project*> touched;
 
             if (r.action == cli::Action::Dispatch) {
-                s = dispatchSpec(r.plan, cfg);
+                // Not a handoff. The run happens in a child with no console
+                // of its own, and its output is rendered here as it arrives.
+                exitCode = cli::runDispatchOnConsole(r.plan, cfg);
                 for (const fs::path& repo : r.plan.repos) {
                     for (Project& p : projects) {
                         if (p.path == repo)
                             touched.push_back(&p);
                     }
                 }
-            } else if (r.project) {
-                s.cwd  = r.project->path;
-                s.mode = r.action == cli::Action::LaunchContinue ? LaunchMode::Continue
-                       : r.action == cli::Action::LaunchResume   ? LaunchMode::Resume
-                                                                 : LaunchMode::New;
-                for (Project& p : projects) {
-                    if (p.path == r.project->path)
-                        touched.push_back(&p);
+                if (cfg.onExit != OnChildExit::Quit) {
+                    // The summary would otherwise vanish behind the list the
+                    // instant it was printed.
+                    cli::waitForKey("press any key to return to the list");
                 }
-            }
-
-            const HandoffResult h = handoff(s, cfg);
-            if (!h.started) {
-                std::fprintf(stderr, "projectman: %s\n", h.error.c_str());
-                exitCode = kLaunchFail;
             } else {
-                exitCode = h.exitCode;
+                if (r.project) {
+                    s.cwd  = r.project->path;
+                    s.mode = r.action == cli::Action::LaunchContinue ? LaunchMode::Continue
+                           : r.action == cli::Action::LaunchResume   ? LaunchMode::Resume
+                                                                     : LaunchMode::New;
+                    for (Project& p : projects) {
+                        if (p.path == r.project->path)
+                            touched.push_back(&p);
+                    }
+                }
+
+                const HandoffResult h = handoff(s, cfg);
+                if (!h.started) {
+                    std::fprintf(stderr, "projectman: %s\n", h.error.c_str());
+                    exitCode = kLaunchFail;
+                } else {
+                    exitCode = h.exitCode;
+                }
             }
 
             if (cfg.onExit == OnChildExit::Quit) {
@@ -899,14 +909,9 @@ int main(int argc, char** argv)
             return kOk;
         }
 
-        std::fprintf(stderr, "dispatching %zu items across %zu repositories\n",
-                     plan.items.size(), plan.repos.size());
-
-        const LaunchSpec s = dispatchSpec(plan, cfg);
-        const HandoffResult h = handoff(s, cfg);
-        if (!h.started)
-            return failWith(kLaunchFail, h.error);
-        return h.exitCode;
+        // The header names the repositories and the rung; the summary at the
+        // end says how it went. Both go to stdout with the rest of the run.
+        return cli::runDispatchOnConsole(plan, cfg);
     }
 
     printUsage();

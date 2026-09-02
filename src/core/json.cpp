@@ -5,7 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace pm::mcp::json {
+namespace pm::json {
 namespace {
 
 // Deep enough for any MCP message, shallow enough that a hostile document
@@ -515,4 +515,4 @@ std::string dump(const Value& v)
     return out;
 }
 
-} // namespace pm::mcp::json
+} // namespace pm::json

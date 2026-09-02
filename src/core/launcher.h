@@ -25,8 +25,14 @@ struct LaunchSpec {
     std::vector<std::string> extra;
 };
 
-// Build the argv for claude.exe. Pure, so it is testable without launching.
+// Build the argv for an interactive claude.exe. Pure, so it is testable
+// without launching.
 std::vector<std::string> claudeArgs(const LaunchSpec& s, const Config& cfg);
+
+// The same session flags for a non-interactive run: -p with a JSON event
+// stream on stdout, and no prompt on the command line, because the prompt goes
+// in on stdin. Pure as well.
+std::vector<std::string> claudePrintArgs(const LaunchSpec& s, const Config& cfg);
 
 struct HandoffResult {
     bool        started  = false;
@@ -61,7 +67,9 @@ bool openInTerminal(const LaunchSpec& s, const Config& cfg, std::string* error);
 bool openShellInTerminal(const fs::path& cwd, const Config& cfg, std::string* error);
 
 // Turn a dispatch plan into a launch: cwd is the projects root, every selected
-// repository is passed with --add-dir, and the briefing becomes the prompt.
+// repository is passed with --add-dir, and the briefing is the prompt. Nothing
+// puts that prompt on a command line any more; the print runner feeds it in on
+// stdin, so its size is not a concern here.
 LaunchSpec dispatchSpec(const DispatchPlan& plan, const Config& cfg);
 
 } // namespace pm

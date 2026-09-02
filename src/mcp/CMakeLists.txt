@@ -10,7 +10,6 @@ pm_configure_rc(PM_MCP_RC "pm-mcp" "pm-mcp.exe" "ProjectMan MCP server"
 add_executable(pm-mcp
     main.cpp
     server.cpp
-    json.cpp
     projects.cpp
     "${PM_MCP_RC}"
 )

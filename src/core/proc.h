@@ -1,5 +1,7 @@
 #pragma once
 
+#include "model.h"
+
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -31,6 +33,46 @@ ProcResult run(const fs::path& exe,
                const std::vector<std::string>& args,
                const fs::path& cwd = {},
                int timeoutMs = 15000);
+
+// ------------------------------------------------------------------ streaming
+
+enum class Stream { Out, Err };
+
+// Receives a child's output a line at a time.
+//
+// Called FROM A READER THREAD, one per stream, so two calls can be in flight at
+// once. Must not block for long: the child is writing into a pipe of a few tens
+// of kilobytes and stalls when nobody drains it.
+class LineSink {
+public:
+    virtual ~LineSink() = default;
+    virtual void onLine(Stream which, std::string line) = 0;
+};
+
+struct StreamSpec {
+    fs::path                 exe;
+    std::vector<std::string> args;
+    fs::path                 cwd;
+    std::string              stdinData;   // written to the child, then EOF
+};
+
+struct StreamResult {
+    bool        started   = false;   // false means CreateProcessW itself failed
+    std::string launchError;
+    int         exitCode  = -1;
+    bool        stopped   = false;   // ended by the token rather than by the child
+    int         elapsedMs = 0;
+};
+
+// Run a program, feed it stdinData, and hand back its output line by line as it
+// arrives. Blocks the calling thread until the child has exited and both
+// streams have hit EOF.
+//
+// The child and everything it starts live in a job object, so raising the
+// token kills the whole tree rather than one process with orphans left
+// holding the pipes. The child sees no window and gets only its three pipe
+// ends, never this process's other inheritable handles.
+StreamResult runStreaming(const StreamSpec& spec, CancelToken& token, LineSink& sink);
 
 // Windows command-line quoting, per the rules CommandLineToArgvW parses back.
 // Exposed because the launcher builds its own command lines.

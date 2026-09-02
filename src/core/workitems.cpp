@@ -298,10 +298,14 @@ DispatchPlan buildDispatchPlan(const WorkList& items, const DispatchOptions& opt
         break;
     }
 
+    // Nobody is at the keyboard during a run, so a question has to be the last
+    // thing said rather than a pause: the run is resumed to answer it.
     rules.emplace_back("Where a step is unclear, or a change would be "
                        "destructive, irreversible, or a judgement call that is "
-                       "mine to make, stop and ask me. Asking is expected, not a "
-                       "failure.");
+                       "mine to make, stop and say so in your final message, "
+                       "with the question spelled out. I will resume this "
+                       "session to answer it. Stopping to ask is expected, not "
+                       "a failure.");
     // Unqualified, this rule forbids exactly what an instruction like "rename
     // every default branch" asks for, and the agent would be right to obey the
     // rule and refuse. It has to name the instruction as a source of work.

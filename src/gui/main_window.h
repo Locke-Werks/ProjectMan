@@ -15,6 +15,7 @@
 #include <thread>
 
 class QCheckBox;
+class QCloseEvent;
 class QFormLayout;
 class QLabel;
 class QLineEdit;
@@ -160,6 +161,7 @@ public:
 
 protected:
     void resizeEvent(QResizeEvent* e) override;
+    void closeEvent(QCloseEvent* e) override;
 
 private slots:
     void onDetailReady(quint64 token, pm::git::RepoDetail detail);
@@ -174,10 +176,15 @@ private:
     void openTerminal();
     void offerDockDownload();
 
+    // Where every Claude Code launch goes: the dock when it is in play, else a
+    // window. `pressed` is the button that asked, shown as DOCKING while a
+    // cold dock comes up; null for a launch with no button behind it.
+    void launchSpec(const LaunchSpec& s, QPushButton* pressed);
+
     // Tries to put a launch in a dock column. False means the caller should do
     // what it did before the dock existed: either the dock is not in play, or
     // it refused and a refusal must not leave the button doing nothing.
-    bool tryDock(const Project& p, LaunchMode mode, bool shell);
+    bool tryDock(const LaunchSpec& s, bool shell, QPushButton* pressed);
 
     // True when Shift is down, which forces a loose window for one launch.
     static bool wantsLooseWindow();

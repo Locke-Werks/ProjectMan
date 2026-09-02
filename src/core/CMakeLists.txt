@@ -7,6 +7,7 @@
 add_library(pm_core STATIC
     strutil.cpp
     proc.cpp
+    json.cpp
     git.cpp
     discovery.cpp
     scanner.cpp
@@ -15,6 +16,8 @@ add_library(pm_core STATIC
     dock.cpp
     workitems.cpp
     launcher.cpp
+    claude_stream.cpp
+    dispatch_run.cpp
 )
 
 target_include_directories(pm_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")

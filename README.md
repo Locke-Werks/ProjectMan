@@ -88,14 +88,25 @@ together and versioned together, but installing one has no effect on the other.
 
 When work is outstanding in several repositories at once, `pm dispatch` (or
 Ctrl+D in either front end) lists every outstanding item as a checklist. Tick
-what you want worked and hit GO. One Claude Code session starts with each
-selected repository passed via `--add-dir` and a briefing of what is outstanding
-where.
+what you want worked and hit GO. One Claude Code session runs with each selected
+repository passed via `--add-dir` and a briefing of what is outstanding where.
+
+The run happens inside ProjectMan, not in a terminal. It is `claude -p`, one
+prompt run to completion, with the briefing fed in on stdin and the session's
+event stream rendered as it arrives: what the session says, one line per tool
+call, and any error a tool returned. The desktop app opens a run window with
+STOP, COPY and CONTINUE; the console prints the same lines and Ctrl+C stops it.
+STOP takes down the session and everything it started. The run ends with a
+summary: how long it took, how many turns, what it cost, and at `suggest`, how
+many tool calls were refused. A session signed in on a subscription draws on
+that subscription's usage rather than an API bill, and the summary says so: the
+dollar figure is then what the tokens would have cost at API rates. CONTINUE resumes the same session interactively,
+in the dock when there is one, with the same repositories, which is how a run
+that stopped to ask something gets its answer.
 
 Selection is per item, not per repository, so one repo can contribute some of
-its work and not the rest. The session is interactive: it asks when something is
-unclear rather than guessing. By default it commits but never pushes, so every
-result is reviewable with `git log` and reversible with `git reset`.
+its work and not the rest. By default the session commits but never pushes, so
+every result is reviewable with `git log` and reversible with `git reset`.
 
 **General instructions** scope the run to one job across the selected
 repositories rather than working the items as found: "ensure every default

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "model.h"
+
 #include <string>
 #include <string_view>
 
@@ -9,6 +11,23 @@ namespace pm::cli {
 // it. _isatty is not enough: it is also true for NUL and every other character
 // device, so a redirected or scheduled run would still stop and ask.
 bool stdinIsConsole();
+
+// Installs the console control handler for a verb that never enters the TUI.
+// Idempotent; ConsoleSession::acquire installs the same one.
+void installInterruptHandler();
+
+// While a token is set, Ctrl+C raises it and pm survives to report the stop.
+// Pass nullptr when the run it guards is over.
+void setInterruptTarget(CancelToken* token);
+
+// One line to stdout: through the console when there is one, as UTF-8 bytes
+// when stdout is a pipe or a file, so a redirected run reads the same text.
+// Safe from any thread.
+void printLine(std::string_view utf8);
+
+// Shows the prompt and blocks until a key is pressed, when stdin is a console.
+// Returns at once when it is not, so a scripted run never hangs here.
+void waitForKey(std::string_view prompt);
 
 // Owns the console's mode, codepage and cursor state, and puts it all back.
 //

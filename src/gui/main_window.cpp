@@ -1,6 +1,7 @@
 #include "main_window.h"
 
 #include "discovery.h"
+#include "dispatch_run_window.h"
 #include "dock.h"
 #include "enrich.h"
 #include "launcher.h"
@@ -13,6 +14,7 @@
 #include <QApplication>
 #include <QCheckBox>
 #include <QClipboard>
+#include <QCloseEvent>
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QFormLayout>
@@ -209,7 +211,9 @@ DispatchDialog::DispatchDialog(WorkList items, const Config& cfg, QWidget* paren
     auto* blurb = caption(
         QStringLiteral("Tick the work to hand over, then GO. One Claude Code session "
                        "gets every selected repository and a briefing of what is "
-                       "outstanding. It will ask you when something is unclear."),
+                       "outstanding, and runs to completion here. Anything it needs "
+                       "from you it says in its final message; CONTINUE picks the "
+                       "session up."),
         kFg3);
     blurb->setWordWrap(true);
     root->addWidget(blurb);
@@ -483,10 +487,14 @@ void SettingsDialog::refreshDerived()
     }
 
     LaunchSpec  spec;
-    QStringList args;
+    QStringList args, print;
     for (const std::string& a : claudeArgs(spec, cfg_))
         args << QString::fromStdString(a);
-    launchLine_->setText(QStringLiteral("claude ") + args.join(QLatin1Char(' ')));
+    for (const std::string& a : claudePrintArgs(spec, cfg_))
+        print << QString::fromStdString(a);
+    launchLine_->setText(QStringLiteral("launch: claude %1\ndispatch: claude %2")
+                             .arg(args.join(QLatin1Char(' ')))
+                             .arg(print.join(QLatin1Char(' '))));
 }
 
 void SettingsDialog::addRow(QFormLayout* form, const Setting& s)
@@ -765,6 +773,30 @@ void MainWindow::resizeEvent(QResizeEvent* e)
     }
 }
 
+void MainWindow::closeEvent(QCloseEvent* e)
+{
+    // A run window is a child of this one, so quitting takes it and its
+    // claude.exe down. Ask first, once, however many are going.
+    const QList<DispatchRunWindow*> runs = findChildren<DispatchRunWindow*>();
+    bool active = false;
+    for (DispatchRunWindow* run : runs)
+        active = active || run->running();
+
+    if (active) {
+        const auto answer = QMessageBox::question(
+            this, QStringLiteral("ProjectMan"),
+            QStringLiteral("A dispatch is still running. Stop it and quit?"),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        if (answer != QMessageBox::Yes) {
+            e->ignore();
+            return;
+        }
+        for (DispatchRunWindow* run : runs)
+            run->stopNow();
+    }
+    e->accept();
+}
+
 void MainWindow::onRowReady(int row, pm::Project project)
 {
     model_->applyStatus(row, project);
@@ -882,29 +914,29 @@ bool MainWindow::wantsLooseWindow()
     return (QApplication::keyboardModifiers() & Qt::ShiftModifier) != 0;
 }
 
-bool MainWindow::tryDock(const Project& p, LaunchMode mode, bool shell)
+bool MainWindow::tryDock(const LaunchSpec& s, bool shell, QPushButton* pressed)
 {
     if (!dockReady_ || wantsLooseWindow())
         return false;
 
-    LaunchSpec s;
-    s.cwd  = p.path;
-    s.mode = mode;
-
     // A cold dock can sit behind a UAC prompt for as long as the user takes to
     // answer, so the button says what it is doing rather than freezing.
-    QPushButton* pressed = shell ? terminal_ : engage_;
-    const QString  was   = pressed->text();
-    pressed->setEnabled(false);
-    pressed->setText(QStringLiteral("DOCKING"));
-    QApplication::processEvents();
+    QString was;
+    if (pressed) {
+        was = pressed->text();
+        pressed->setEnabled(false);
+        pressed->setText(QStringLiteral("DOCKING"));
+        QApplication::processEvents();
+    }
 
     std::string        why;
-    const dock::Status st = shell ? dock::launchShell(p.path, cfg_, &why)
+    const dock::Status st = shell ? dock::launchShell(s.cwd, cfg_, &why)
                                   : dock::launch(s, cfg_, &why);
 
-    pressed->setText(was);
-    pressed->setEnabled(true);
+    if (pressed) {
+        pressed->setText(was);
+        pressed->setEnabled(true);
+    }
 
     if (st == dock::Status::Ok)
         return true;
@@ -927,22 +959,26 @@ bool MainWindow::tryDock(const Project& p, LaunchMode mode, bool shell)
     return false;
 }
 
+void MainWindow::launchSpec(const LaunchSpec& s, QPushButton* pressed)
+{
+    if (tryDock(s, /*shell=*/false, pressed))
+        return;
+
+    std::string err;
+    if (!openInTerminal(s, cfg_, &err))
+        QMessageBox::warning(this, QStringLiteral("ProjectMan"), QString::fromStdString(err));
+}
+
 void MainWindow::launch(LaunchMode mode)
 {
     const Project* p = current();
     if (!p)
         return;
 
-    if (tryDock(*p, mode, /*shell=*/false))
-        return;
-
     LaunchSpec s;
     s.cwd  = p->path;
     s.mode = mode;
-
-    std::string err;
-    if (!openInTerminal(s, cfg_, &err))
-        QMessageBox::warning(this, QStringLiteral("ProjectMan"), QString::fromStdString(err));
+    launchSpec(s, engage_);
 }
 
 void MainWindow::openTerminal()
@@ -951,7 +987,9 @@ void MainWindow::openTerminal()
     if (!p)
         return;
 
-    if (tryDock(*p, LaunchMode::New, /*shell=*/true))
+    LaunchSpec s;
+    s.cwd = p->path;
+    if (tryDock(s, /*shell=*/true, terminal_))
         return;
 
     // A terminal with nothing attached. openInTerminal always appends
@@ -976,12 +1014,13 @@ void MainWindow::openDispatch()
     if (dlg.exec() != QDialog::Accepted)
         return;
 
-    const DispatchPlan plan = dlg.plan();
-    LaunchSpec         s    = dispatchSpec(plan, cfg_);
-
-    std::string err;
-    if (!openInTerminal(s, cfg_, &err))
-        QMessageBox::warning(this, QStringLiteral("ProjectMan"), QString::fromStdString(err));
+    // The run happens here, in a window of its own, rather than in a terminal:
+    // it is one prompt, run to completion, and its output is worth keeping in
+    // front of the list it came from.
+    auto* run = new DispatchRunWindow(dlg.plan(), cfg_, dockReady_, this);
+    connect(run, &DispatchRunWindow::continueRequested, this,
+            [this](const LaunchSpec& s) { launchSpec(s, nullptr); });
+    run->show();
 }
 
 void MainWindow::onDetailReady(quint64 token, pm::git::RepoDetail d)

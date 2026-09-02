@@ -5,37 +5,12 @@
 #include <windows.h>
 
 #include <atomic>
-#include <fstream>
 #include <system_error>
 
 namespace pm {
 namespace {
 
 std::atomic<bool> g_childLive{ false };
-
-// Windows caps a command line at 32767 characters. A briefing spanning several
-// repositories can approach that, so anything large goes to a file and the
-// prompt points at it instead of risking a truncated or rejected launch.
-constexpr size_t kMaxInlinePrompt = 8000;
-
-fs::path spillPrompt(const std::string& text)
-{
-    wchar_t     buf[MAX_PATH] = {};
-    const DWORD n = GetTempPathW(static_cast<DWORD>(std::size(buf)), buf);
-    if (n == 0 || n >= std::size(buf))
-        return {};
-
-    const fs::path dir = fs::path(std::wstring(buf, n)) / "ProjectMan";
-    std::error_code ec;
-    fs::create_directories(dir, ec);
-
-    const fs::path out = dir / "dispatch-briefing.md";
-    std::ofstream  f(out, std::ios::binary | std::ios::trunc);
-    if (!f)
-        return {};
-    f.write(text.data(), static_cast<std::streamsize>(text.size()));
-    return out;
-}
 
 } // namespace
 
@@ -44,6 +19,14 @@ bool childLive() { return g_childLive.load(std::memory_order_acquire); }
 std::vector<std::string> claudeArgs(const LaunchSpec& s, const Config& cfg)
 {
     std::vector<std::string> args;
+
+    // First, and never last. --add-dir is variadic: claude reads every bare
+    // token after it as another directory, so a prompt placed after the last
+    // one was swallowed as a path and the session started with nothing to do.
+    for (const fs::path& d : s.addDirs) {
+        args.emplace_back("--add-dir");
+        args.push_back(d.string());
+    }
 
     // Composed from the settings rather than stored as a literal command line,
     // so the autonomy ladder actually reaches the session. At Suggest, skipping
@@ -77,18 +60,29 @@ std::vector<std::string> claudeArgs(const LaunchSpec& s, const Config& cfg)
         args.push_back(model);
     }
 
-    for (const fs::path& d : s.addDirs) {
-        args.emplace_back("--add-dir");
-        args.push_back(d.string());
-    }
-
     args.insert(args.end(), s.extra.begin(), s.extra.end());
 
-    // The prompt is positional and must come last, or claude reads the flags
-    // that follow it as part of the prompt.
-    if (!s.prompt.empty())
+    // Behind a "--", so that whatever option ends up immediately before it,
+    // variadic or not, cannot claim the prompt as one of its values.
+    if (!s.prompt.empty()) {
+        args.emplace_back("--");
         args.push_back(s.prompt);
+    }
 
+    return args;
+}
+
+std::vector<std::string> claudePrintArgs(const LaunchSpec& s, const Config& cfg)
+{
+    LaunchSpec quiet = s;
+    quiet.prompt.clear();
+
+    std::vector<std::string> args = claudeArgs(quiet, cfg);
+    args.emplace_back("-p");
+    args.emplace_back("--output-format");
+    args.emplace_back("stream-json");
+    // stream-json refuses to run without it.
+    args.emplace_back("--verbose");
     return args;
 }
 
@@ -274,17 +268,7 @@ LaunchSpec dispatchSpec(const DispatchPlan& plan, const Config& cfg)
     s.cwd     = cfg.root;
     s.mode    = LaunchMode::New;
     s.addDirs = plan.repos;
-
-    if (plan.briefing.size() <= kMaxInlinePrompt) {
-        s.prompt = plan.briefing;
-    } else {
-        const fs::path spill = spillPrompt(plan.briefing);
-        s.prompt = spill.empty()
-            ? plan.briefing.substr(0, kMaxInlinePrompt)
-            : "Read " + spill.string()
-                  + " and follow it. It is the briefing for this session.";
-    }
-
+    s.prompt  = plan.briefing;
     return s;
 }
 
