@@ -10,7 +10,7 @@ env:
   # v0.3.0 or later is required: [[options]] and `when` are ignored rather than
   # rejected by older builds, which inverts them instead of disabling them, and
   # this installer gates its PATH entry on one.
-  FORGE_VERSION: v0.3.0
+  FORGE_VERSION: v0.4.0
 
 jobs:
   release:
