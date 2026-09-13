@@ -1,5 +1,6 @@
 #include "main_window.h"
 
+#include "agent_board_window.h"
 #include "discovery.h"
 #include "dispatch_run_window.h"
 #include "dock.h"
@@ -34,10 +35,99 @@
 #include <QTableWidget>
 #include <QVBoxLayout>
 
+#include <unordered_map>
+
+// After the Qt headers on purpose. windows.h is a wall of macros and Qt's own
+// headers are the ones that suffer for it.
+#include <windows.h>
+#include <tlhelp32.h>
+
 namespace pm::gui {
 namespace {
 
 using namespace pm::theme;
+
+BOOL CALLBACK collectVisibleTopLevel(HWND hwnd, LPARAM param)
+{
+    // GW_OWNER filters out dialogs and tool windows, which belong to a frame
+    // that is itself in this enumeration and is the one worth raising.
+    if (!IsWindowVisible(hwnd) || GetWindow(hwnd, GW_OWNER))
+        return TRUE;
+
+    DWORD pid = 0;
+    if (GetWindowThreadProcessId(hwnd, &pid) == 0 || pid == 0)
+        return TRUE;
+
+    auto* owners = reinterpret_cast<std::unordered_map<DWORD, HWND>*>(param);
+    owners->emplace(pid, hwnd);
+    return TRUE;
+}
+
+void bringToFront(HWND hwnd)
+{
+    if (IsIconic(hwnd))
+        ShowWindow(hwnd, SW_RESTORE);
+
+    // SetForegroundWindow obeys only the process that already owns the
+    // foreground, so the two input queues are joined for the length of the
+    // call. Without this the taskbar button flashes and the window stays put.
+    const DWORD self  = GetCurrentThreadId();
+    const DWORD front = GetWindowThreadProcessId(GetForegroundWindow(), nullptr);
+    const bool  joined = front != 0 && front != self
+                         && AttachThreadInput(self, front, TRUE) != 0;
+
+    SetForegroundWindow(hwnd);
+
+    if (joined)
+        AttachThreadInput(self, front, FALSE);
+}
+
+// Raises the window the session is showing through, which is almost never its
+// own: claude.exe runs inside Windows Terminal or a Docked Console column and
+// the window belongs to the host. So this walks up the parent chain and raises
+// the first ancestor that owns a visible top-level window.
+//
+// Best effort by design. A pane shares its host window with every other pane in
+// it, so the host comes forward but the tab does not switch, and a session
+// whose chain owns no window raises nothing at all. Raising the nearest window
+// instead would pull something unrelated in front of the person.
+void raiseSessionWindow(unsigned long pid)
+{
+    if (pid == 0)
+        return;
+
+    std::unordered_map<DWORD, HWND> owners;
+    EnumWindows(&collectVisibleTopLevel, reinterpret_cast<LPARAM>(&owners));
+
+    std::unordered_map<DWORD, DWORD> parents;
+    const HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W e{};
+        e.dwSize = sizeof(e);
+        if (Process32FirstW(snap, &e)) {
+            do {
+                parents[e.th32ProcessID] = e.th32ParentProcessID;
+            } while (Process32NextW(snap, &e));
+        }
+        CloseHandle(snap);
+    }
+
+    // The parent pid in a snapshot is whatever created the process, which may
+    // have exited and had its pid handed to something else. The hop cap is what
+    // stops a recycled pid pointing back into the chain and looping.
+    DWORD cur = pid;
+    for (int hops = 0; hops < 16; ++hops) {
+        const auto win = owners.find(cur);
+        if (win != owners.end()) {
+            bringToFront(win->second);
+            return;
+        }
+        const auto up = parents.find(cur);
+        if (up == parents.end() || up->second == 0 || up->second == cur)
+            return;
+        cur = up->second;
+    }
+}
 
 QLabel* caption(const QString& text, pm::theme::Rgb colour, int px = 12)
 {
@@ -685,10 +775,15 @@ MainWindow::MainWindow(Config cfg, QWidget* parent)
     sessions_ = new QPushButton(QStringLiteral("SESSIONS"));
     terminal_ = new QPushButton(QStringLiteral("TERMINAL"));
     dispatch_ = new QPushButton(QStringLiteral("DISPATCH"));
+    agents_   = new QPushButton(QStringLiteral("AGENTS"));
     engage_->setObjectName(QStringLiteral("Primary"));
 
+    // The board is about every session on the machine, not the selected row, so
+    // it stays enabled whatever the table is doing.
+    agents_->setToolTip(QStringLiteral("Every Claude Code session on this machine"));
+
     for (QPushButton* b : { engage_, resume_, sessions_, terminal_, dispatch_,
-                            settingsBtn_ })
+                            agents_, settingsBtn_ })
         b->setFont(theme::tracked(11, QFont::Bold, 0.14));
 
     dl->addWidget(engage_);
@@ -700,6 +795,7 @@ MainWindow::MainWindow(Config cfg, QWidget* parent)
     row3->addWidget(terminal_);
     row3->addWidget(dispatch_);
     dl->addLayout(row3);
+    dl->addWidget(agents_);
     dl->addWidget(settingsBtn_);
 
     // Where a launch lands, and the only place the dock is named now that
@@ -725,6 +821,7 @@ MainWindow::MainWindow(Config cfg, QWidget* parent)
     connect(scan_, &ScanController::rowReady, this, &MainWindow::onRowReady);
     connect(scan_, &ScanController::sweepFinished, this, &MainWindow::onSweepFinished);
     connect(scan_, &ScanController::enrichFinished, this, &MainWindow::updateCounts);
+    connect(scan_, &ScanController::enrichFinished, this, &MainWindow::feedBoard);
     connect(scan_, &ScanController::discovered, this, [this](int n) {
         ProjectList blanks(static_cast<size_t>(n));
         model_->setProjects(std::move(blanks));
@@ -739,6 +836,7 @@ MainWindow::MainWindow(Config cfg, QWidget* parent)
     connect(sessions_, &QPushButton::clicked, this, [this] { launch(LaunchMode::Resume); });
     connect(terminal_, &QPushButton::clicked, this, &MainWindow::openTerminal);
     connect(dispatch_, &QPushButton::clicked, this, &MainWindow::openDispatch);
+    connect(agents_, &QPushButton::clicked, this, &MainWindow::openBoard);
     connect(settingsBtn_, &QPushButton::clicked, this, &MainWindow::openSettings);
 
     // The same bindings as the console front end, so muscle memory carries
@@ -756,6 +854,8 @@ MainWindow::MainWindow(Config cfg, QWidget* parent)
                   [this] { launch(LaunchMode::Resume); });
     new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_T), this,
                   [this] { openTerminal(); });
+    new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_B), this,
+                  [this] { openBoard(); });
     new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_Comma), this,
                   [this] { openSettings(); });
 
@@ -794,6 +894,14 @@ void MainWindow::closeEvent(QCloseEvent* e)
         for (DispatchRunWindow* run : runs)
             run->stopNow();
     }
+
+    // Closed rather than left to the child teardown, because its destructor is
+    // what joins the watcher thread. A thread still waiting on
+    // ReadDirectoryChangesW after the event loop has gone is an app that never
+    // finishes exiting.
+    if (boardWindow_)
+        boardWindow_->close();
+
     e->accept();
 }
 
@@ -810,6 +918,7 @@ void MainWindow::onSweepFinished(int probed, int failed, double seconds)
                          .arg(failed)
                          .arg(seconds, 0, 'f', 2));
     updateCounts();
+    feedBoard();
 }
 
 void MainWindow::updateCounts()
@@ -1002,7 +1111,29 @@ void MainWindow::openTerminal()
 
 void MainWindow::openDispatch()
 {
-    WorkList items = collectWorkItems(model_->projects());
+    openDispatchFor({});
+}
+
+void MainWindow::openDispatchFor(const fs::path& cwd)
+{
+    ProjectList scope = model_->projects();
+
+    // The board hands over a directory, not a project. Narrowing to the one it
+    // names is the point of dispatching from a card; a path the sweep never
+    // indexed has nothing to collect from and falls back to the whole tree.
+    if (!cwd.empty()) {
+        ProjectList one;
+        for (const Project& p : scope) {
+            if (p.path == cwd) {
+                one.push_back(p);
+                break;
+            }
+        }
+        if (!one.empty())
+            scope = std::move(one);
+    }
+
+    WorkList items = collectWorkItems(scope);
     if (items.empty()) {
         QMessageBox::information(this, QStringLiteral("ProjectMan"),
                                  QStringLiteral("Nothing outstanding to dispatch."));
@@ -1021,6 +1152,50 @@ void MainWindow::openDispatch()
     connect(run, &DispatchRunWindow::continueRequested, this,
             [this](const LaunchSpec& s) { launchSpec(s, nullptr); });
     run->show();
+}
+
+void MainWindow::openBoard()
+{
+    if (boardWindow_) {
+        boardWindow_->show();
+        boardWindow_->raise();
+        boardWindow_->activateWindow();
+        return;
+    }
+
+    auto* board = new AgentBoardWindow(model_->projects(), this);
+    boardWindow_ = board;
+
+    // The board decides nothing about how a session starts. It names a
+    // directory and the answer comes back through the same launch path the
+    // buttons use, so the dock, the autonomy ladder and the Shift override stay
+    // settled in one place.
+    connect(board, &AgentBoardWindow::focusRequested, this,
+            [](unsigned long pid) { raiseSessionWindow(pid); });
+    connect(board, &AgentBoardWindow::engageRequested, this,
+            [this](pm::fs::path cwd) {
+                LaunchSpec s;
+                s.cwd  = std::move(cwd);
+                s.mode = LaunchMode::New;
+                launchSpec(s, nullptr);
+            });
+    connect(board, &AgentBoardWindow::continueRequested, this,
+            [this](pm::fs::path cwd) {
+                LaunchSpec s;
+                s.cwd  = std::move(cwd);
+                s.mode = LaunchMode::Continue;
+                launchSpec(s, nullptr);
+            });
+    connect(board, &AgentBoardWindow::dispatchRequested, this,
+            [this](pm::fs::path cwd) { openDispatchFor(cwd); });
+
+    board->show();
+}
+
+void MainWindow::feedBoard()
+{
+    if (boardWindow_)
+        boardWindow_->setProjects(model_->projects());
 }
 
 void MainWindow::onDetailReady(quint64 token, pm::git::RepoDetail d)

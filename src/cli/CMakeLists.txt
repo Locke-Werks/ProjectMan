@@ -7,6 +7,7 @@ add_executable(pm
     main.cpp
     console.cpp
     dispatch_console.cpp
+    hook.cpp
     tui.cpp
     "${PM_CLI_RC}"
 )

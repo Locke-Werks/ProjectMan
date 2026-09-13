@@ -52,9 +52,11 @@ std::string oneLine(std::string s, size_t max)
     return s;
 }
 
-// The one thing about a tool call worth a line: the command, the file, the
-// pattern. Falls back to the description Claude wrote, then to the first
-// string it was given at all.
+} // namespace
+
+// Declared in the header, so it sits outside the anonymous namespace above. The
+// helpers it uses are still reachable: an anonymous namespace's members are
+// visible in the namespace enclosing it.
 std::string toolSummary(const std::string& name, const json::Value* input)
 {
     std::string s;
@@ -85,6 +87,8 @@ std::string toolSummary(const std::string& name, const json::Value* input)
 
     return oneLine(std::move(s), kSummaryChars);
 }
+
+namespace {
 
 // A tool result's content is a string, or an array of blocks each with text.
 std::string resultText(const json::Value* content)

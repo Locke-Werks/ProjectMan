@@ -330,21 +330,29 @@ private:
                 ++i_;
         }
 
-        const std::string text(s_.substr(start, i_ - start));
+        // The span above is a complete, validated JSON number. Keeping it is
+        // what lets the dump side hand back the literal a person wrote instead
+        // of whatever survives the trip through double.
+        std::string text(s_.substr(start, i_ - start));
 
         if (isInt) {
             errno = 0;
             char*           end = nullptr;
             const long long n   = std::strtoll(text.c_str(), &end, 10);
             if (errno == 0 && end && *end == '\0') {
-                *out = makeInt(static_cast<std::int64_t>(n));
+                *out     = makeInt(static_cast<std::int64_t>(n));
+                out->raw = std::move(text);
                 return true;
             }
             // Too big for an integer. Still a valid JSON number, so it falls
             // through to a double rather than being rejected.
         }
 
-        *out = makeNumber(std::strtod(text.c_str(), nullptr));
+        // strtod saturates 1e400 to infinity and rounds 0.1 to the nearest
+        // representable double. Both losses stop at the parsed value: raw is
+        // what gets written back out.
+        *out     = makeNumber(std::strtod(text.c_str(), nullptr));
+        out->raw = std::move(text);
         return true;
     }
 
@@ -392,7 +400,13 @@ void dumpInto(const Value& v, std::string* out)
         out->append(v.boolean ? "true" : "false");
         return;
     case Value::Type::Number:
-        if (v.isInteger) {
+        if (!v.raw.empty()) {
+            // Parsed numbers go back out as they came in. Re-formatting turns a
+            // hand-written 0.1 into 0.10000000000000001, 1.5e3 into 1500,
+            // 10000000000000000000 into 1e+19 and 1e400 into null, all of them
+            // during an install that was only meant to add a hook entry.
+            out->append(v.raw);
+        } else if (v.isInteger) {
             out->append(std::to_string(v.integer));
         } else if (!std::isfinite(v.number)) {
             // JSON has no way to write these, and emitting a bare NaN would
@@ -433,6 +447,58 @@ void dumpInto(const Value& v, std::string* out)
         out->push_back('}');
         return;
     }
+    }
+}
+
+void dumpPrettyInto(const Value& v, int indent, int depth, std::string* out)
+{
+    const auto pad = [&](int level) { out->append(static_cast<size_t>(level * indent), ' '); };
+
+    switch (v.type) {
+    case Value::Type::Array: {
+        if (v.array.empty()) {
+            out->append("[]");
+            return;
+        }
+        out->append("[\n");
+        bool first = true;
+        for (const Value& item : v.array) {
+            if (!first)
+                out->append(",\n");
+            first = false;
+            pad(depth + 1);
+            dumpPrettyInto(item, indent, depth + 1, out);
+        }
+        out->push_back('\n');
+        pad(depth);
+        out->push_back(']');
+        return;
+    }
+    case Value::Type::Object: {
+        if (v.object.empty()) {
+            out->append("{}");
+            return;
+        }
+        out->append("{\n");
+        bool first = true;
+        for (const auto& [key, item] : v.object) {
+            if (!first)
+                out->append(",\n");
+            first = false;
+            pad(depth + 1);
+            dumpString(key, out);
+            out->append(": ");
+            dumpPrettyInto(item, indent, depth + 1, out);
+        }
+        out->push_back('\n');
+        pad(depth);
+        out->push_back('}');
+        return;
+    }
+    default:
+        // Scalars carry no layout of their own.
+        dumpInto(v, out);
+        return;
     }
 }
 
@@ -512,6 +578,14 @@ std::string dump(const Value& v)
     std::string out;
     out.reserve(256);
     dumpInto(v, &out);
+    return out;
+}
+
+std::string dumpPretty(const Value& v, int indent)
+{
+    std::string out;
+    out.reserve(1024);
+    dumpPrettyInto(v, indent < 0 ? 0 : indent, 0, &out);
     return out;
 }
 

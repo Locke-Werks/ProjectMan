@@ -9,6 +9,7 @@
 #include <QDialog>
 #include <QMainWindow>
 #include <QMetaType>
+#include <QPointer>
 
 #include <condition_variable>
 #include <mutex>
@@ -28,6 +29,7 @@ Q_DECLARE_METATYPE(pm::Project)
 
 namespace pm::gui {
 
+class AgentBoardWindow;
 class GrainOverlay;
 class ProjectFilterProxy;
 class ProjectModel;
@@ -191,7 +193,23 @@ private:
 
     void refreshDockNote();
     void openDispatch();
+
+    // The dispatch dialog scoped to one project, which is what the board's
+    // DISPATCH asks for. An empty path, or one the scan does not know, falls
+    // back to the whole tree.
+    void openDispatchFor(const fs::path& cwd);
+
     void openSettings();
+
+    // Shows the agent board, raising the one already up rather than opening a
+    // second. The window is WA_DeleteOnClose, so boardWindow_ is a QPointer and
+    // every later use has to test it.
+    void openBoard();
+
+    // Hands the board the scan's latest result, which its cards take their
+    // project names from. Called on every sweep and enrich.
+    void feedBoard();
+
     void updateCounts();
 
     Config cfg_;
@@ -217,7 +235,10 @@ private:
     QPushButton* sessions_ = nullptr;
     QPushButton* terminal_ = nullptr;
     QPushButton* dispatch_ = nullptr;
+    QPushButton* agents_   = nullptr;
     QPushButton* settingsBtn_ = nullptr;
+
+    QPointer<AgentBoardWindow> boardWindow_;
 
     QLabel* dockNote_ = nullptr;
 

@@ -5,6 +5,7 @@
 #include "dock.h"
 #include "enrich.h"
 #include "git.h"
+#include "hook.h"
 #include "launcher.h"
 #include "scanner.h"
 #include "strutil.h"
@@ -88,6 +89,7 @@ void printUsage()
         "  pm doctor                   resolve git, claude and wt, and time a sweep\n"
         "  pm config [show|get|set]    read or change settings\n"
         "  pm settings                 edit settings interactively\n"
+        "  pm hook [install|status]    register the Claude Code hooks the board reads\n"
         "\n"
         "Options:\n"
         "  --dirty                     only projects with uncommitted changes\n"
@@ -411,6 +413,13 @@ int main(int argc, char** argv)
         printUsage();
         return kOk;
     }
+
+    // Ahead of Config::load, which writes a default projectman.toml when none
+    // exists. The receiver runs on every tool call in every session, and a hook
+    // creating settings behind someone's back is the one thing src/cli/hook.h
+    // rules out. It needs no config of its own either way.
+    if (a.verb == "hook")
+        return cli::hookCommand(a.positional);
 
     ConfigStatus status = ConfigStatus::Missing;
     std::string  detail;

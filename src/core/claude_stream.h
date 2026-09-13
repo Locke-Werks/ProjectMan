@@ -1,6 +1,7 @@
 #pragma once
 
 #include "config.h"
+#include "json.h"
 #include "proc.h"
 #include "workitems.h"
 
@@ -53,6 +54,14 @@ struct Event {
 // One stdout line to zero or more events. An assistant line carries a content
 // array, and each block is its own event.
 std::vector<Event> parseLine(std::string_view line);
+
+// The one thing about a tool call worth a line: the command, the file, the
+// pattern. Falls back to the description Claude wrote, then to the first string
+// it was given at all.
+//
+// Exposed because a hook payload carries the same tool_name and tool_input as
+// the stream does, and a tool call should read the same wherever it is shown.
+std::string toolSummary(const std::string& name, const json::Value* input);
 
 Event stderrEvent(std::string line);
 

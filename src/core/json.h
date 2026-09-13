@@ -15,7 +15,9 @@ namespace pm::json {
 // guaranteed to work, so the members are laid out flat and the unused ones stay
 // empty. This wastes a few dozen bytes per node and buys a type that is
 // obviously correct, which for a server parsing a handful of small messages is
-// the right trade.
+// the right trade. The same reasoning covers `raw` below: a parsed number
+// carries its own source text instead of the dump side trying to reconstruct
+// one from a double.
 struct Value {
     enum class Type { Null, Bool, Number, String, Array, Object };
 
@@ -28,6 +30,18 @@ struct Value {
     // back byte-for-byte as they went in. Tracking which one it was is what
     // keeps id 1 from being answered as 1.0.
     bool isInteger = false;
+    // The number exactly as the source text spelled it, empty for one built in
+    // code. Neither double nor int64 can hold every JSON number: 0.1 has no
+    // exact binary form, 1e400 is infinity, and 10000000000000000000 overflows
+    // an int64 and comes back out as 1e+19. Re-formatting from the parsed value
+    // therefore rewrites literals, and a hook install that reads a
+    // hand-maintained settings file, adds one entry and writes it back must not
+    // edit numbers it was never asked to touch. The parser only fills this in
+    // from a span it has already validated as a JSON number, so emitting it
+    // verbatim cannot produce a document that will not parse. It wins over
+    // `number` and `integer` on the way out, so changing either of those on a
+    // parsed value means clearing this as well.
+    std::string raw;
 
     std::string                                string;
     std::vector<Value>                         array;
@@ -55,5 +69,12 @@ bool parse(std::string_view text, Value* out, std::string* error);
 
 // Compact, no spaces, no trailing newline.
 std::string dump(const Value& v);
+
+// Indented, one member per line, no trailing newline.
+//
+// For files a person reads and edits. Rewriting a hand-maintained settings file
+// through dump() would collapse it to a single line, which is a worse change
+// than whatever was being edited.
+std::string dumpPretty(const Value& v, int indent = 2);
 
 } // namespace pm::json
