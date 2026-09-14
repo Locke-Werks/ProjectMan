@@ -6,6 +6,7 @@
 
 **Every project you have, what state it is in, and Claude Code one keystroke away.**
 
+[![release](https://img.shields.io/github/v/release/Locke-Werks/ProjectMan?style=flat-square&color=d6262a)](https://github.com/Locke-Werks/ProjectMan/releases)
 [![license](https://img.shields.io/badge/license-GPLv3-d6262a?style=flat-square)](LICENSE)
 [![platform](https://img.shields.io/badge/platform-Windows%2011-d6262a?style=flat-square)](#requirements)
 
@@ -15,7 +16,9 @@
 
 A projects directory grows past the point where you can hold it in your head.
 ProjectMan indexes it, shows the git state and outstanding work for every
-project in it, and launches Claude Code into the one you pick.
+project in it, and launches Claude Code into the one you pick. Once sessions are
+running it shows what each of them is doing, and which one stopped to ask you
+something.
 
 Two front ends over one core.
 
@@ -53,6 +56,49 @@ that owns the column.
 Needs Docked Console 0.4.0 or newer, and 0.4.1 for TERMINAL, which asks for a
 plain shell rather than a command. An older one cannot take a pane and says so.
 If it is not installed at all, ProjectMan offers the download.
+
+## Agents
+
+`Ctrl+B`, or the AGENTS button, opens a board of every Claude Code session on
+the machine: one card each, sorted into NEEDS YOU, WORKING, IDLE and DONE, and
+moving as the sessions move rather than when you rescan. Desktop only.
+
+The column comes from the session registry Claude Code keeps for itself at
+`~/.claude/sessions/<pid>.json`, one file per running process. That is the only
+thing that knows a session is alive, and the only thing still true after one is
+killed without warning. It is also where a session waiting on a permission
+prompt says so, and what it is waiting for, so NEEDS YOU is read rather than
+inferred from a transcript.
+
+The rest of the card is what the session is actually doing: the prompt it was
+given, the tool call in flight, the question it asked. That comes from Claude
+Code's hooks, and needs registering once:
+
+```
+pm hook install
+```
+
+That writes six entries into `~/.claude/settings.json`, merging with whatever is
+already there and tagging each one, so `pm hook uninstall` takes back exactly its
+own and leaves every other hook alone. `pm hook status` says which state you are
+in. Without it the board still works, from the registry alone: you see who is
+alive and who needs you, but not what any of them is doing.
+
+The board only reports. ENGAGE, CONTINUE and DISPATCH are the same launches the
+project list offers, aimed at the session's repository. FOCUS raises the window a
+session is showing through, which is best effort and says so: `claude.exe`
+usually has no window of its own, so it raises the terminal or the dock hosting
+the session, and a dock column shares one window across every pane in it.
+
+Nothing here writes to Claude Code's own files. The registry is read, never
+touched, and the only file ProjectMan writes for this is its own event log under
+`%LOCALAPPDATA%\ProjectMan\agents`.
+
+A session's name comes from Claude Code and changes as the work changes topic, so
+a card renames itself over a long session. The registry is undocumented and
+carries the version that wrote it, so an unrecognised value is shown rather than
+dropped, and a Claude Code that stops publishing it costs the columns, not the
+board.
 
 ## ProjectMan MCP
 
@@ -133,6 +179,7 @@ pm items [--json]           every outstanding item across the tree
 pm dispatch [--all] [--dry-run] [-i "<instructions>"]
 pm refresh                  refetch open pull requests and issues
 pm doctor                   resolve git, claude and wt, and time a sweep
+pm hook <install|uninstall|status>   the hooks the agent board reads
 pm config [show|get <key>|set <key> <value>] [--path|--init]
 ```
 
@@ -158,6 +205,7 @@ Every action is Ctrl-modified, because bare letters go to the filter.
 | Ctrl+T | open a plain shell |
 | Shift+Enter, Ctrl+Shift+T | the same, in a loose window rather than the dock |
 | Ctrl+D | dispatch |
+| Ctrl+B | the agent board (desktop only) |
 | F2 | settings (Ctrl+, in the desktop app) |
 | F5 | rescan |
 | Ctrl+Q | quit |
@@ -234,6 +282,11 @@ Windows 11. `git` on PATH. `claude` for launching, `gh` for pull requests and
 issues, Windows Terminal for the desktop front end, and Docked Console 0.4.0 or
 newer for DOCK; each is optional and only that feature is unavailable without
 it.
+
+The agent board needs a Claude Code that publishes its session registry, which
+2.1.270 does. An older one that does not leaves the board empty until
+`pm hook install`, after which it fills from the hooks instead, without the
+columns the registry decides.
 
 ## Building
 

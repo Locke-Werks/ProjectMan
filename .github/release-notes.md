@@ -5,6 +5,42 @@ current terminal to Claude Code in the one you pick. `ProjectMan.exe` shows the
 same data as a desktop dashboard and launches into a new Windows Terminal
 window.
 
+New in 0.7.0: **an agent board.** `Ctrl+B`, or the AGENTS button, opens a board
+of every Claude Code session on the machine, one card each, in NEEDS YOU,
+WORKING, IDLE or DONE, moving as the sessions move rather than when you rescan.
+Desktop only.
+
+The column comes from the session registry Claude Code keeps for itself at
+`~/.claude/sessions/<pid>.json`. That is the only thing that knows a session is
+alive, and the only thing still true after one is killed without warning; it is
+also where a session waiting on a permission prompt says so and says what for,
+so NEEDS YOU is read rather than inferred from a transcript. The rest of the
+card, the prompt it was given and the tool call in flight, comes from Claude
+Code's hooks and needs `pm hook install` once. Without that the board still
+works from the registry alone: who is alive and who needs you, but not what any
+of them is doing.
+
+`pm hook install` writes six entries into `~/.claude/settings.json` and tags
+each one, so `pm hook uninstall` takes back exactly its own and leaves every
+other hook alone. That file is hand-maintained, so being careful with it is most
+of the work: a failure to read it refuses rather than treating it as absent and
+replacing it, a duplicate key refuses rather than guessing which copy wins, a
+symlinked file is written through rather than replaced, and a change made while
+`pm` was working aborts the write instead of reverting it. Install then
+uninstall returns the file byte for byte.
+
+`pm hook` itself runs on the critical path of every tool call in every session,
+so it loads no config, prints nothing and always exits 0. Exit code 2 in
+particular is what Claude Code reads from a `PreToolUse` hook as a refusal, so
+even the usage path returns 0 once stdin is not a console.
+
+The board only reports. ENGAGE, CONTINUE and DISPATCH are the launches the
+project list already offers, aimed at the session's repository. FOCUS raises the
+window a session is showing through, which is best effort: `claude.exe` usually
+has no window of its own, so it raises the terminal or the dock hosting the
+session, and a dock column shares one window across every pane in it. Nothing
+writes to Claude Code's own files.
+
 New in 0.6.0: **dispatch runs inside ProjectMan.** GO no longer opens a terminal
 with an interactive session in it; it runs `claude -p` with the briefing on
 stdin and shows the session's event stream as it arrives, in a run window on the

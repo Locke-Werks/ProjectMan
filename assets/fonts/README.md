@@ -13,5 +13,3 @@ alongside each, as the OFL requires.
 - Outfit, Smartsheet Inc. and Rodrigo Fuenzalida. `OFL-Outfit.txt`
 
 Outfit is the variable weight axis file, which covers 300 to 700 from one face.
-
-Refresh with `scripts/fetch-fonts.sh`.
