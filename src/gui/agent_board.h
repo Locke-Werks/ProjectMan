@@ -207,7 +207,10 @@ struct AgentCard {
 
     std::string activity;    // "Edit src/gui/agent_board.cpp", from PreToolUse
     std::string prompt;      // the last thing asked of it, from UserPromptSubmit
-    std::string attention;   // what it is waiting for, when column is NeedsYou
+    // What it is waiting for. Empty in every other column, because this is the
+    // one line the card draws in red and a question somebody has already
+    // answered must not go on being asked from Working.
+    std::string attention;   // NeedsYou only
 
     // What the session has running underneath it. A subagent is not a card of
     // its own: it has no process, no window and no prompt to answer, so there

@@ -402,9 +402,14 @@ struct Building {
     bool        waiting = false;
     std::string waitingFor;
 
-    // A Notification that nothing has answered yet. Set when one arrives and
-    // cleared by the events that mean someone dealt with it.
-    bool notifying = false;
+    // A Notification that nothing has answered yet, and what it asked for. Both
+    // are set when one arrives and cleared by the events that mean someone
+    // dealt with it, which is why the text is here rather than on the card: a
+    // question that has been answered is not one the card should still be
+    // asking, and one written straight onto the card outlives the flag that
+    // says it is live.
+    bool        notifying = false;
+    std::string notice;
 
     // Subagents by agent_id, so an event and a meta file can arrive in either
     // order and land on the same one. The card's vector is built from this at
@@ -457,6 +462,15 @@ std::string toolLine(const AgentEvent& ev)
     return line + ev.detail;
 }
 
+// The session moved on, so whatever it stopped to ask has been dealt with.
+// Both halves of the question go together: the flag decides the column and the
+// text is what the card says while it is there.
+void answered(Building& b)
+{
+    b.notifying = false;
+    b.notice.clear();
+}
+
 void applyEvent(Building& b, const AgentEvent& ev)
 {
     if (b.card.cwd.empty())
@@ -496,17 +510,16 @@ void applyEvent(Building& b, const AgentEvent& ev)
     if (ev.event == "PreToolUse") {
         if (std::string line = toolLine(ev); !line.empty())
             b.card.activity = std::move(line);
-        b.notifying = false;
+        answered(b);
     } else if (ev.event == "UserPromptSubmit") {
         if (!ev.detail.empty())
             b.card.prompt = ev.detail;
-        b.notifying = false;
+        answered(b);
     } else if (ev.event == "Notification") {
-        if (!ev.detail.empty())
-            b.card.attention = ev.detail;
+        b.notice    = ev.detail;
         b.notifying = true;
     } else if (ev.event == "Stop") {
-        b.notifying = false;
+        answered(b);
     }
 }
 
@@ -979,10 +992,14 @@ AgentList buildBoard(const std::vector<RegistryEntry>& registry,
         else
             c.column = AgentColumn::Done;
 
-        // waitingFor is the registry's own account of what it wants, and it is
-        // all there is when the column was decided without a Notification.
-        if (c.attention.empty())
-            c.attention = b.waitingFor;
+        // Only a card in NeedsYou has something to say here, and it says it in
+        // red, so a line left over from a question that was answered is a card
+        // shouting for someone who is no longer needed. The notice is what the
+        // Notification asked for while it stands; waitingFor is the registry's
+        // own account of what it wants, and it is all there is when the column
+        // was decided without a Notification.
+        if (c.column == AgentColumn::NeedsYou)
+            c.attention = (b.notifying && !b.notice.empty()) ? b.notice : b.waitingFor;
         if (c.name.empty())
             c.name = leafName(c.cwd);
 
