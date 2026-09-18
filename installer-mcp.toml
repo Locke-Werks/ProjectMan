@@ -7,7 +7,7 @@
 
 [product]
 name         = "ProjectMan MCP"
-version      = "0.7.0"
+version      = "0.8.0"
 publisher    = "Locke Werks"
 description  = "An MCP server that reports your projects tree"
 copyright    = "Copyright (C) 2026 Locke Werks"
