@@ -445,9 +445,52 @@ fs::path settingsPath()
     return profile / ".claude" / "settings.json";
 }
 
+// The command Claude Code is asked to run, quoted for a SHELL and not for
+// CreateProcess.
+//
+// The two rules are not the same and the difference is silent. proc::quoteArg
+// follows the CRT's argv rule, which leaves an argument alone unless it holds a
+// space, and backslashes mean nothing to CreateProcess. Claude Code runs a hook
+// through bash, where an unquoted backslash is an escape character, so
+// C:\Users\me\pm.exe arrived as CUsersmepm.exe and every hook on this machine
+// failed with "command not found". It went unnoticed because an installed
+// pm.exe lives under Program Files, whose space makes quoteArg quote it: the
+// bug only appears when pm.exe sits in a path with no space in it, which is
+// every development build.
+//
+// Double quotes rather than single, because they are quotes in cmd as well and
+// there is no promise anywhere that the shell stays bash. Inside them bash
+// still acts on four characters, so those are escaped and nothing else is: a
+// path with none of them, which is all but a handful, comes out plainly
+// readable in a file someone may well open.
 std::string hookCommandLine(const fs::path& exe)
 {
-    return quoteArg(narrow(exe.wstring())) + " hook";
+    const std::string path = narrow(exe.wstring());
+
+    std::string out;
+    out.reserve(path.size() + 8);
+    out.push_back('"');
+
+    const auto special = [](char c) {
+        return c == '"' || c == '$' || c == '`' || c == '\\';
+    };
+
+    for (std::size_t i = 0; i < path.size(); ++i) {
+        const char c = path[i];
+        if (c == '"' || c == '$' || c == '`') {
+            out.push_back('\\');
+        } else if (c == '\\' && i + 1 < path.size() && special(path[i + 1])) {
+            // A separator sitting in front of something that is about to be
+            // escaped has to be escaped too, or bash consumes this backslash
+            // against the next one and the escape it was protecting is left
+            // bare.
+            out.push_back('\\');
+        }
+        out.push_back(c);
+    }
+
+    out.push_back('"');
+    return out + " hook";
 }
 
 // Value::find is const-only, and rewriting the tree needs the other one.
@@ -1081,12 +1124,17 @@ int status()
     // reporting what is registered still beats calling it stale on no evidence.
     const bool current = want.empty() || (r.commands.size() == 1 && r.commands[0] == want);
 
+    // Not "registered to a different pm.exe", which is only one of the reasons
+    // this differs and was the wrong one the day the quoting changed: every
+    // install on earth was suddenly out of date while still naming the same
+    // executable. The two lines below say which, so the headline does not
+    // guess.
     std::printf("  %s\n", current ? "installed"
-                                  : "installed, but registered to a different pm.exe");
+                                  : "installed, but the registered command is out of date");
     for (const std::string& command : r.commands)
         std::printf("  %-10s %s\n", "runs", command.c_str());
     if (!current && !want.empty())
-        std::printf("  %-10s %s\n", "this one", want.c_str());
+        std::printf("  %-10s %s\n", "should run", want.c_str());
     std::printf("  %-10s %s\n", "events", joined(r.events).c_str());
     if (!missing.empty())
         std::printf("  %-10s %s\n", "missing", joined(missing).c_str());
