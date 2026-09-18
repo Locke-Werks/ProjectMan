@@ -350,7 +350,7 @@ int receiveBody()
     // Stop carries nothing of its own: the card keeps whatever came before it.
 
     std::vector<std::pair<std::string, json::Value>> record;
-    record.reserve(6);
+    record.reserve(9);
     record.emplace_back("ts", json::makeInt(nowUnixMs()));
     record.emplace_back("event", json::makeString(event));
 
@@ -366,6 +366,23 @@ int receiveBody()
         record.emplace_back("tool", json::makeString(tool));
     if (!detail.empty())
         record.emplace_back("detail", json::makeString(detail));
+
+    // Absent on everything the session did itself, which is most lines, so this
+    // costs the log nothing until subagents are actually running.
+    const std::string agent = stringField(&payload, "agent_id");
+    if (!agent.empty()) {
+        record.emplace_back("agent", json::makeString(agent));
+
+        const std::string agentType = stringField(&payload, "agent_type");
+        if (!agentType.empty())
+            record.emplace_back("agentType", json::makeString(agentType));
+    }
+
+    if (event == "PreToolUse") {
+        const std::string toolUse = stringField(&payload, "tool_use_id");
+        if (!toolUse.empty())
+            record.emplace_back("toolUse", json::makeString(toolUse));
+    }
 
     const fs::path log = eventLogPath();
     if (log.empty())
@@ -415,12 +432,24 @@ int receive()
 // Every event install registers. PostToolUse is deliberately absent: a tool
 // that has already returned is the previous state of the card, bought by
 // doubling the write rate on the busiest event there is.
+//
+// SubagentStart and SubagentStop are the exception to that reasoning, and the
+// only pair that is. They are the sole thing on the machine that says a
+// subagent ended: the meta file Claude Code writes when one spawns is never
+// rewritten, so without SubagentStop a subagent can be seen to start and never
+// to finish. Two lines per subagent is nothing beside the tool calls it makes
+// in between.
+//
+// Adding to this list makes an existing registration incomplete rather than
+// wrong, which `pm hook status` reports and `pm hook install` repairs in place.
 constexpr const char* kEvents[] = {
     "SessionStart",
     "UserPromptSubmit",
     "PreToolUse",
     "Notification",
     "Stop",
+    "SubagentStart",
+    "SubagentStop",
     "SessionEnd",
 };
 

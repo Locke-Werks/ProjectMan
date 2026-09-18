@@ -22,6 +22,7 @@ class QLabel;
 class QLineEdit;
 class QPlainTextEdit;
 class QPushButton;
+class QStackedWidget;
 class QTableView;
 class QTableWidget;
 
@@ -29,10 +30,11 @@ Q_DECLARE_METATYPE(pm::Project)
 
 namespace pm::gui {
 
-class AgentBoardWindow;
+class AgentBoardPanel;
 class GrainOverlay;
 class ProjectFilterProxy;
 class ProjectModel;
+class TabLabel;
 class TrackedLabel;
 
 // Owns the worker thread and marshals every result onto the GUI thread.
@@ -201,10 +203,10 @@ private:
 
     void openSettings();
 
-    // Shows the agent board, raising the one already up rather than opening a
-    // second. The window is WA_DeleteOnClose, so boardWindow_ is a QPointer and
-    // every later use has to test it.
-    void openBoard();
+    // Which of the two tabs is showing. The board keeps watching either way:
+    // that is what puts a live count on the tab you are not on.
+    enum class Tab { Projects, Agents };
+    void showTab(Tab tab);
 
     // Hands the board the scan's latest result, which its cards take their
     // project names from. Called on every sweep and enrich.
@@ -218,11 +220,19 @@ private:
     ProjectFilterProxy* proxy_ = nullptr;
     ScanController*     scan_  = nullptr;
 
-    QTableView*   table_  = nullptr;
-    QLineEdit*    filter_ = nullptr;
-    TrackedLabel* eyebrow_ = nullptr;
-    QLabel*       counts_ = nullptr;
-    GrainOverlay* grain_  = nullptr;
+    QTableView*     table_ = nullptr;
+    QLineEdit*      filter_ = nullptr;
+    QStackedWidget* pages_  = nullptr;
+    TabLabel*       projectsTab_ = nullptr;
+    TabLabel*       agentsTab_   = nullptr;
+    QLabel*         counts_ = nullptr;
+    GrainOverlay*   grain_  = nullptr;
+
+    // One counts slot, two tabs. Each side keeps its own text so switching back
+    // does not show the other tab's numbers until the next sweep.
+    QString projectCounts_;
+    QString agentCounts_;
+    Tab     tab_ = Tab::Projects;
 
     QLabel* detailName_   = nullptr;
     QLabel* detailPath_   = nullptr;
@@ -235,10 +245,11 @@ private:
     QPushButton* sessions_ = nullptr;
     QPushButton* terminal_ = nullptr;
     QPushButton* dispatch_ = nullptr;
-    QPushButton* agents_   = nullptr;
     QPushButton* settingsBtn_ = nullptr;
 
-    QPointer<AgentBoardWindow> boardWindow_;
+    // Built at startup and never destroyed before the window, so its watcher is
+    // running from launch rather than from the first time the tab is opened.
+    AgentBoardPanel* board_ = nullptr;
 
     QLabel* dockNote_ = nullptr;
 

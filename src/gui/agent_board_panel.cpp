@@ -1,4 +1,4 @@
-#include "agent_board_window.h"
+#include "agent_board_panel.h"
 
 #include "strutil.h"
 #include "theme_qt.h"
@@ -11,6 +11,7 @@
 #include <QLabel>
 #include <QPushButton>
 #include <QScrollArea>
+#include <QStringList>
 #include <QVBoxLayout>
 #include <QVariant>
 
@@ -131,15 +132,6 @@ private:
     DWORD      buffer_[kNotifyBytes / sizeof(DWORD)]{};
 };
 
-QLabel* caption(const QString& text, pm::theme::Rgb colour, int px = 12)
-{
-    auto* l = new QLabel(text);
-    l->setFont(theme::body(px));
-    l->setStyleSheet(QStringLiteral("color: %1;").arg(theme::c(colour).name()));
-    l->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    return l;
-}
-
 // A line inside a card. Deliberately not selectable: a label that takes the
 // mouse press swallows the click that selects the card under it. The background
 // is cleared because the global sheet paints every QWidget black, which on a
@@ -175,6 +167,52 @@ QString cardStyle(bool selected)
 // Which card a click landed on. A QFrame has no clicked signal, and one filter
 // on the window beats a widget subclass for something rebuilt wholesale.
 constexpr const char* kSessionProperty = "pmSession";
+
+// What one card will spend on the work underneath it before summarising the
+// rest. A single workflow run here has reached 173 agents; a card listing them
+// would be the only thing on the board.
+constexpr int kMaxWorkflowLines = 2;
+constexpr int kMaxAgentLines    = 4;
+
+// Said on any line the board cannot call live, which is every subagent line on
+// a machine with no hooks registered. The distinction is real and silence about
+// it would read as "this finished" rather than "nothing here can tell you".
+const char* const kNoStopEvent =
+    "Seen to start. Only a hook says when a subagent ends: run `pm hook install`.";
+
+QString workflowLine(const WorkflowRun& w)
+{
+    QString s = QString::fromStdString(w.name);
+    if (!w.phase.empty())
+        s += QStringLiteral("  ") + QString::fromStdString(w.phase);
+
+    if (w.finished())
+        s += QStringLiteral("  %1 %2").arg(w.spawned).arg(QString::fromStdString(w.status));
+    else if (w.running > 0)
+        s += QStringLiteral("  %1/%2").arg(w.running).arg(w.spawned);
+    else
+        s += QStringLiteral("  %1 agents").arg(w.spawned);
+    return s;
+}
+
+QString agentLine(const SubAgent& a)
+{
+    // Inside a workflow every agent is typed "workflow-subagent", which says
+    // nothing the run's own line has not already said. The phase it was spawned
+    // into is the part that differs between them.
+    std::string label = a.workflowRun.empty() ? a.type : a.phase;
+    if (label.empty())
+        label = a.type.empty() ? "agent" : a.type;
+
+    // What it is doing beats what it was asked to do, and a subagent only has
+    // the first once a hook has reported one of its tool calls.
+    const std::string detail = a.activity.empty() ? a.description : a.activity;
+
+    QString s = QString::fromStdString(label);
+    if (!detail.empty())
+        s += QStringLiteral("  ") + QString::fromStdString(detail);
+    return s;
+}
 
 } // namespace
 
@@ -307,11 +345,22 @@ void BoardController::buildAndPost()
         projects = projects_;
     }
 
-    // Both reads and the fold run here rather than on the GUI thread. They open
+    // Every read and the fold run here rather than on the GUI thread. They open
     // and parse files, which is the whole reason this thread exists.
     const std::vector<RegistryEntry> registry = readRegistry(sessionRegistryDir());
     const std::vector<AgentEvent>    events   = readEvents(eventLogPath());
-    const AgentList                  board    = buildBoard(registry, events, projects);
+
+    // Live sessions only. A session directory outlives its session by design,
+    // so reading every one of them would be reading the whole history of the
+    // machine to describe work that finished weeks ago.
+    std::vector<SessionFiles> files;
+    files.reserve(registry.size());
+    for (const RegistryEntry& e : registry) {
+        if (!e.sessionId.empty())
+            files.push_back(sessions_.read(e.sessionId, e.cwd));
+    }
+
+    const AgentList board = buildBoard(registry, events, files, projects);
 
     // Emitted from inside the posted lambda, so the signal runs on the GUI
     // thread as a direct call and the list never crosses as a queued argument.
@@ -319,29 +368,17 @@ void BoardController::buildAndPost()
         this, [this, board] { emit boardReady(board); }, Qt::QueuedConnection);
 }
 
-// ----------------------------------------------------------- AgentBoardWindow
+// ------------------------------------------------------------ AgentBoardPanel
 
-AgentBoardWindow::AgentBoardWindow(ProjectList projects, QWidget* parent)
-    : QDialog(parent, Qt::Window)
+AgentBoardPanel::AgentBoardPanel(ProjectList projects, QWidget* parent)
+    : QWidget(parent)
 {
-    setAttribute(Qt::WA_DeleteOnClose);
-    setWindowTitle(QStringLiteral("Agents"));
-    resize(1180, 740);
-
     auto* root = new QVBoxLayout(this);
-    root->setContentsMargins(18, 14, 18, 16);
+    // No title and no counts of its own: the main window's head row already
+    // names this tab and holds the one counts slot, and a second copy of either
+    // under it would say the same thing twice.
+    root->setContentsMargins(18, 0, 18, 16);
     root->setSpacing(12);
-
-    auto* head    = new QHBoxLayout;
-    auto* eyebrow = new TrackedLabel(QStringLiteral("// Agents"), 15, QFont::Bold, 0.18);
-    eyebrow->setStyleSheet(QStringLiteral("color: %1;").arg(theme::c(kRed).name()));
-    head->addWidget(eyebrow);
-    head->addStretch(1);
-
-    counts_ = caption(QStringLiteral("reading"), kFg4, 11);
-    counts_->setFont(theme::mono(11));
-    head->addWidget(counts_);
-    root->addLayout(head);
 
     auto* board = new QHBoxLayout;
     board->setSpacing(12);
@@ -389,7 +426,6 @@ AgentBoardWindow::AgentBoardWindow(ProjectList projects, QWidget* parent)
     engage_   = new QPushButton(QStringLiteral("ENGAGE"));
     continue_ = new QPushButton(QStringLiteral("CONTINUE"));
     dispatch_ = new QPushButton(QStringLiteral("DISPATCH"));
-    close_    = new QPushButton(QStringLiteral("CLOSE"));
 
     // Getting to the session that is asking for you is what the board is for.
     focus_->setObjectName(QStringLiteral("Primary"));
@@ -402,7 +438,7 @@ AgentBoardWindow::AgentBoardWindow(ProjectList projects, QWidget* parent)
     continue_->setToolTip(QStringLiteral("Resume the most recent session in this project."));
     dispatch_->setToolTip(QStringLiteral("Hand this project's outstanding work to a session."));
 
-    for (QPushButton* b : { focus_, engage_, continue_, dispatch_, close_ }) {
+    for (QPushButton* b : { focus_, engage_, continue_, dispatch_ }) {
         b->setFont(theme::tracked(11, QFont::Bold, 0.14));
         buttons->addWidget(b);
     }
@@ -424,43 +460,41 @@ AgentBoardWindow::AgentBoardWindow(ProjectList projects, QWidget* parent)
         if (const AgentCard* c = selected(); c && !c->cwd.empty())
             emit dispatchRequested(c->cwd);
     });
-    // CLOSE, Escape and the title-bar X all end in QDialog's own close path,
-    // which hides the window and honours WA_DeleteOnClose by itself. Nothing to
-    // override: this window asks nothing on the way out, and a reject() that
-    // calls close() re-enters the close already in flight, which the is_closing
-    // guard drops, leaving a window that cannot be shut at all.
-    connect(close_, &QPushButton::clicked, this, &QWidget::close);
-
     refreshActions();
 
     watch_ = std::make_unique<BoardController>();
-    connect(watch_.get(), &BoardController::boardReady, this, &AgentBoardWindow::onBoardReady);
+    connect(watch_.get(), &BoardController::boardReady, this, &AgentBoardPanel::onBoardReady);
     watch_->setProjects(std::move(projects));
     watch_->start();
 }
 
-AgentBoardWindow::~AgentBoardWindow()
+AgentBoardPanel::~AgentBoardPanel()
 {
     // First, before any widget goes: the watcher posts to the controller, and
     // what the controller posts rebuilds these columns.
+    shutdown();
+}
+
+void AgentBoardPanel::shutdown()
+{
     if (watch_)
         watch_->shutdown();
 }
 
-void AgentBoardWindow::setProjects(ProjectList projects)
+void AgentBoardPanel::setProjects(ProjectList projects)
 {
     if (watch_)
         watch_->setProjects(std::move(projects));
 }
 
-void AgentBoardWindow::onBoardReady(AgentList board)
+void AgentBoardPanel::onBoardReady(AgentList board)
 {
     board_ = std::move(board);
     rebuildCards();
     refreshActions();
 }
 
-void AgentBoardWindow::rebuildCards()
+void AgentBoardPanel::rebuildCards()
 {
     // Cleared and rebuilt whole. The board arrives as one list of a handful of
     // cards, four times a minute at rest, and a model with a view over it would
@@ -498,20 +532,34 @@ void AgentBoardWindow::rebuildCards()
                                     .arg(placed));
     }
 
-    int live  = 0;
-    int needs = 0;
+    int live   = 0;
+    int needs  = 0;
+    int agents = 0;
     for (const AgentCard& c : board_) {
         if (c.live)
             ++live;
         if (c.column == AgentColumn::NeedsYou)
             ++needs;
+        for (const SubAgent& a : c.agents) {
+            if (a.state == AgentState::Running)
+                ++agents;
+        }
     }
-    counts_->setText(board_.empty()
-                         ? QStringLiteral("no sessions")
-                         : QStringLiteral("%1 live  %2 need you").arg(live).arg(needs));
+
+    QString counts = QStringLiteral("%1 live  %2 need you").arg(live).arg(needs);
+    if (agents > 0)
+        counts += QStringLiteral("  %1 agents").arg(agents);
+    emit countsChanged(board_.empty() ? QStringLiteral("no sessions") : counts);
+
+    // The tab wears this number, so it is the one thing here that has to reach
+    // the main window whether or not this panel is the visible tab.
+    if (needs != attention_) {
+        attention_ = needs;
+        emit attentionChanged(needs);
+    }
 }
 
-QFrame* AgentBoardWindow::buildCard(const AgentCard& card)
+QFrame* AgentBoardPanel::buildCard(const AgentCard& card)
 {
     const QString session = QString::fromStdString(card.sessionId);
 
@@ -557,6 +605,63 @@ QFrame* AgentBoardWindow::buildCard(const AgentCard& card)
         cl->addWidget(prompt);
     }
 
+    // What the session has running underneath it: workflow runs first, since
+    // each one accounts for a block of the agents below it, then the agents
+    // themselves. A finished run stays on the card because the agents it
+    // accounts for are still being counted against it.
+    // Elided from the middle, not the right, on every line below here. These
+    // are a tool name followed by a path, and four subagents reading four files
+    // in one tree cut to four identical lines when the tail is the half thrown
+    // away. The run lines carry their counts at the end for the same reason.
+    int shown = 0;
+    for (const WorkflowRun& w : card.workflows) {
+        if (shown == kMaxWorkflowLines)
+            break;
+        auto* line = cardLine(w.finished() ? kFg4 : kFg2, theme::mono(10));
+        setElided(line, workflowLine(w), Qt::ElideMiddle);
+        cl->addWidget(line);
+        ++shown;
+    }
+    if (const int over = static_cast<int>(card.workflows.size()) - shown; over > 0) {
+        auto* more = cardLine(kFg4, theme::mono(10));
+        more->setText(QStringLiteral("+%1 more runs").arg(over));
+        cl->addWidget(more);
+    }
+
+    // Loose subagents only. One inside a workflow is already counted on its
+    // run's line, and listing it again would double every number on the card.
+    int agents = 0;
+    int hidden = 0;
+    for (const SubAgent& a : card.agents) {
+        if (!a.workflowRun.empty() || a.state == AgentState::Finished)
+            continue;
+        if (agents == kMaxAgentLines) {
+            ++hidden;
+            continue;
+        }
+
+        const bool running = a.state == AgentState::Running;
+        auto*      line    = cardLine(running ? kFg2 : kFg4, theme::mono(10));
+        setElided(line, agentLine(a), Qt::ElideMiddle);
+        if (!running)
+            line->setToolTip(QString::fromLatin1(kNoStopEvent));
+        cl->addWidget(line);
+        ++agents;
+    }
+
+    const int done = card.looseAgents(AgentState::Finished);
+    if (hidden > 0 || done > 0) {
+        QStringList parts;
+        if (hidden > 0)
+            parts << QStringLiteral("+%1 more").arg(hidden);
+        if (done > 0)
+            parts << QStringLiteral("%1 done").arg(done);
+
+        auto* rest = cardLine(kFg4, theme::mono(10));
+        rest->setText(parts.join(QStringLiteral("  ")));
+        cl->addWidget(rest);
+    }
+
     const std::int64_t ms = card.lastActivityMs > 0 ? card.lastActivityMs : card.startedAtMs;
     QString            foot = QString::fromStdString(pm::relativeAge(ms / 1000));
     if (card.live && card.pid != 0)
@@ -569,7 +674,7 @@ QFrame* AgentBoardWindow::buildCard(const AgentCard& card)
     return frame;
 }
 
-void AgentBoardWindow::refreshActions()
+void AgentBoardPanel::refreshActions()
 {
     const AgentCard* c = selected();
 
@@ -581,7 +686,7 @@ void AgentBoardWindow::refreshActions()
     dispatch_->setEnabled(haveCwd);
 }
 
-void AgentBoardWindow::setSelected(const QString& sessionId)
+void AgentBoardPanel::setSelected(const QString& sessionId)
 {
     if (selected_ == sessionId)
         return;
@@ -602,7 +707,7 @@ void AgentBoardWindow::setSelected(const QString& sessionId)
     refreshActions();
 }
 
-int AgentBoardWindow::indexOf(const QString& sessionId) const
+int AgentBoardPanel::indexOf(const QString& sessionId) const
 {
     if (sessionId.isEmpty())
         return -1;
@@ -613,13 +718,13 @@ int AgentBoardWindow::indexOf(const QString& sessionId) const
     return -1;
 }
 
-const AgentCard* AgentBoardWindow::selected() const
+const AgentCard* AgentBoardPanel::selected() const
 {
     const int i = indexOf(selected_);
     return i < 0 ? nullptr : &board_[static_cast<size_t>(i)];
 }
 
-bool AgentBoardWindow::eventFilter(QObject* watched, QEvent* e)
+bool AgentBoardPanel::eventFilter(QObject* watched, QEvent* e)
 {
     if (e->type() == QEvent::MouseButtonPress) {
         // The card's own labels take no mouse interaction, so a click anywhere
@@ -628,7 +733,7 @@ bool AgentBoardWindow::eventFilter(QObject* watched, QEvent* e)
         if (session.isValid())
             setSelected(session.toString());
     }
-    return QDialog::eventFilter(watched, e);
+    return QWidget::eventFilter(watched, e);
 }
 
 } // namespace pm::gui

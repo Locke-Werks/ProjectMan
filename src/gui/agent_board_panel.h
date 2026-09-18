@@ -3,9 +3,9 @@
 #include "agent_board.h"
 #include "model.h"
 
-#include <QDialog>
 #include <QMetaType>
 #include <QString>
+#include <QWidget>
 
 #include <memory>
 #include <mutex>
@@ -76,27 +76,51 @@ private:
 
     std::mutex  mutex_;
     ProjectList projects_;   // guarded by mutex_
+
+    // Touched only by the worker, which is the one thread that calls read().
+    SessionFileReader sessions_;
 };
 
 // Every Claude Code session on this machine, as four columns of cards that
-// follow the sessions as they move. Non-modal, so the project list stays usable
-// behind it.
+// follow the sessions as they move.
 //
-// The window launches nothing. Each action emits and MainWindow answers, so the
+// A tab of the main window rather than a window of its own, and built once at
+// startup rather than on first use, so the watcher runs whether or not the tab
+// is showing. That is the point of it being a tab: the count of sessions
+// waiting on someone is on the tab itself, so the answer to "is anything
+// asking for me" does not require being on this tab to see.
+//
+// The panel launches nothing. Each action emits and MainWindow answers, so the
 // dock, the autonomy ladder and the Shift override keep being decided in one
 // place instead of two.
-class AgentBoardWindow : public QDialog {
+class AgentBoardPanel : public QWidget {
     Q_OBJECT
 
 public:
-    explicit AgentBoardWindow(ProjectList projects, QWidget* parent = nullptr);
-    ~AgentBoardWindow() override;
+    explicit AgentBoardPanel(ProjectList projects, QWidget* parent = nullptr);
+    ~AgentBoardPanel() override;
 
     // The scan's result, which cards take their project name from. MainWindow
     // hands over a fresh one whenever a sweep finishes.
     void setProjects(ProjectList projects);
 
+    // Stops the watcher thread and waits for it.
+    //
+    // Called from MainWindow::closeEvent rather than left to the destructor,
+    // because a thread still sitting in ReadDirectoryChangesW when the event
+    // loop has gone is a process that never exits. Safe to call twice.
+    void shutdown();
+
 signals:
+    // How many cards are in NEEDS YOU. MainWindow puts it on the tab, which is
+    // the whole reason the watcher keeps running while the tab is hidden.
+    void attentionChanged(int waiting);
+
+    // "3 live  1 need you  5 agents", for the one counts slot in the main
+    // window's head row. Held there rather than repeated here, so the two tabs
+    // read as two views of one window instead of two windows in a stack.
+    void countsChanged(QString summary);
+
     // Raise the session's own window. Live cards only: a card in Done carries a
     // pid that belongs to nothing, or by now to something else.
     void focusRequested(unsigned long pid);
@@ -126,7 +150,6 @@ private:
     // what it posts writes into these widgets.
     std::unique_ptr<BoardController> watch_;
 
-    QLabel*                    counts_ = nullptr;
     std::vector<TrackedLabel*> heads_;     // one per column, in columnOrder()
     std::vector<QVBoxLayout*>  columns_;   // the same order; holds the cards
     std::vector<QFrame*>       cards_;     // index for index with board_
@@ -135,7 +158,11 @@ private:
     QPushButton* engage_   = nullptr;
     QPushButton* continue_ = nullptr;
     QPushButton* dispatch_ = nullptr;
-    QPushButton* close_    = nullptr;
+
+    // Only re-emitted when it moves. The board rebuilds every few seconds and
+    // almost every rebuild changes nothing, so a signal per rebuild would
+    // repaint the tab label for no reason.
+    int attention_ = -1;
 };
 
 } // namespace pm::gui

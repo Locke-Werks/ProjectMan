@@ -45,6 +45,19 @@ constexpr std::int64_t kMaxEventBytes = 8 * 1024 * 1024;
 // A registry record is about 600 bytes. Anything near this is not one.
 constexpr std::int64_t kMaxRegistryBytes = 256 * 1024;
 
+// An agent meta file is a couple of hundred bytes.
+constexpr std::int64_t kMaxMetaBytes = 64 * 1024;
+
+// A workflow summary carries the entire script it ran. The largest here is
+// 52KB and a script has no size limit of its own, so this is a bound on what
+// the board will parse rather than a size anything is expected to reach.
+constexpr std::int64_t kMaxWorkflowBytes = 4 * 1024 * 1024;
+
+// One session that spawned more subagents than this has outrun what a card can
+// usefully say, and the cache stops being a cache. Every run here fits inside
+// it by two orders of magnitude; the largest ever seen was 173.
+constexpr std::size_t kMaxCachedAgents = 20000;
+
 // The tail of a file, read without taking it away from whoever is writing it.
 //
 // Sessions append to the event log continuously and Claude Code rewrites a
@@ -153,6 +166,109 @@ unsigned long long ticksField(const json::Value* object, const char* key)
     if (v->type == json::Value::Type::Number && v->isInteger && v->integer > 0)
         return static_cast<unsigned long long>(v->integer);
     return 0;
+}
+
+// --------------------------------------------------------- session files
+
+// The write time of a file, as Unix milliseconds. Zero when it cannot be read.
+//
+// A meta file is written once, when its subagent spawns, so its own timestamp
+// is when that subagent started. Nothing inside it says so.
+std::int64_t fileWriteTimeMs(const fs::path& file)
+{
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!GetFileAttributesExW(file.c_str(), GetFileExInfoStandard, &data))
+        return 0;
+
+    ULARGE_INTEGER t{};
+    t.LowPart  = data.ftLastWriteTime.dwLowDateTime;
+    t.HighPart = data.ftLastWriteTime.dwHighDateTime;
+    if (t.QuadPart < static_cast<unsigned long long>(kFileTimeUnixEpoch))
+        return 0;
+    return (static_cast<std::int64_t>(t.QuadPart) - kFileTimeUnixEpoch) / 10000;
+}
+
+// A cwd as Claude Code spells the directory it keeps that session's files in:
+// every character that is not a letter or a digit becomes a dash, and runs are
+// not collapsed, so "C:\p\My App" is "C--p-My-App".
+//
+// Checked against all 28 project directories on this machine by reading each
+// transcript's own cwd back and recomputing the name: 28 matches, 0 misses.
+// It is not invertible, since a project whose name contains a dash spells the
+// same as one containing a space, so this only ever goes cwd to slug.
+//
+// If a later Claude Code changes the rule, the cost is the subagent lines on a
+// card. Everything the board already showed is read from somewhere else.
+std::string projectSlug(const fs::path& cwd)
+{
+    std::string s = narrow(cwd.wstring());
+    while (s.size() > 1 && (s.back() == '\\' || s.back() == '/'))
+        s.pop_back();
+
+    for (char& c : s) {
+        const bool alnum = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+                        || (c >= '0' && c <= '9');
+        if (!alnum)
+            c = '-';
+    }
+    return s;
+}
+
+// "agent-a06be1cc93c314534.meta.json" holds exactly the agent_id a hook
+// reports, so the file source and the hook source join on it with no mapping.
+std::string agentIdFromMeta(const fs::path& file)
+{
+    static constexpr std::string_view kPrefix = "agent-";
+    static constexpr std::string_view kSuffix = ".meta.json";
+
+    const std::string name = narrow(file.filename().wstring());
+    if (name.size() <= kPrefix.size() + kSuffix.size())
+        return {};
+    if (name.compare(0, kPrefix.size(), kPrefix) != 0)
+        return {};
+    if (name.compare(name.size() - kSuffix.size(), kSuffix.size(), kSuffix) != 0)
+        return {};
+
+    return name.substr(kPrefix.size(), name.size() - kPrefix.size() - kSuffix.size());
+}
+
+// "projectman-board-fixes-wf_a3f3cbaa-9df.js" is the run's name and its id
+// joined by a dash, and both halves hold dashes of their own, so the split is
+// on the last "-wf_" rather than the first dash.
+bool splitScriptName(const fs::path& file, std::string* name, std::string* runId)
+{
+    static constexpr std::string_view kJoin = "-wf_";
+
+    const std::string stem = narrow(file.stem().wstring());
+    const std::size_t at   = stem.rfind(kJoin);
+    if (at == std::string::npos || at == 0)
+        return false;
+
+    *name  = stem.substr(0, at);
+    *runId = stem.substr(at + 1);   // keeps the "wf_", which is the id's own prefix
+    return !name->empty() && runId->size() > 3;
+}
+
+// One agent-<id>.meta.json. Written at spawn and never rewritten, which is why
+// nothing here reports a state: see AgentState in the header.
+SubAgent readAgentMeta(const fs::path& file, std::string id, std::string runId)
+{
+    SubAgent a;
+    a.id             = std::move(id);
+    a.workflowRun    = std::move(runId);
+    a.startedAtMs    = fileWriteTimeMs(file);
+    a.lastActivityMs = a.startedAtMs;
+
+    json::Value doc;
+    std::string error;
+    const std::string text = readShared(file, kMaxMetaBytes);
+    if (!json::parse(text, &doc, &error) || doc.type != json::Value::Type::Object)
+        return a;   // the id and the spawn time still make a line worth showing
+
+    a.type        = anyString(&doc, "agentType");
+    a.description = anyString(&doc, "description");
+    a.phase       = anyString(&doc, "workflowPhase");
+    return a;
 }
 
 // -------------------------------------------------------------- still alive
@@ -289,7 +405,24 @@ struct Building {
     // A Notification that nothing has answered yet. Set when one arrives and
     // cleared by the events that mean someone dealt with it.
     bool notifying = false;
+
+    // Subagents by agent_id, so an event and a meta file can arrive in either
+    // order and land on the same one. The card's vector is built from this at
+    // the end, once there is something to sort by.
+    std::unordered_map<std::string, SubAgent> agents;
 };
+
+// The subagent an event belongs to, made if this is the first sign of it.
+SubAgent& agentFor(Building& b, const AgentEvent& ev)
+{
+    SubAgent& a = b.agents[ev.agentId];
+    if (a.id.empty())
+        a.id = ev.agentId;
+    if (a.type.empty())
+        a.type = ev.agentType;
+    a.lastActivityMs = std::max(a.lastActivityMs, ev.tsMs);
+    return a;
+}
 
 std::int64_t registryActivity(const RegistryEntry& e)
 {
@@ -313,11 +446,45 @@ void applyRegistry(Building& b, const RegistryEntry& e)
     b.card.lastActivityMs = std::max(b.card.lastActivityMs, registryActivity(e));
 }
 
+// The tool line an event describes: "Edit  src/gui/agent_board.cpp".
+std::string toolLine(const AgentEvent& ev)
+{
+    std::string line = ev.tool;
+    if (ev.detail.empty())
+        return line;
+    if (!line.empty())
+        line += "  ";
+    return line + ev.detail;
+}
+
 void applyEvent(Building& b, const AgentEvent& ev)
 {
     if (b.card.cwd.empty())
         b.card.cwd = ev.cwd;
     b.card.lastActivityMs = std::max(b.card.lastActivityMs, ev.tsMs);
+
+    // A subagent's tool calls carry its parent's session_id and nothing else to
+    // tell them apart, so anything naming an agent is filed under that agent
+    // and never touches the card's own line. Without this, a session running
+    // five subagents shows whichever of them called a tool last as what the
+    // session itself is doing, which is the one thing the card claims to say.
+    if (!ev.agentId.empty()) {
+        SubAgent& a = agentFor(b, ev);
+        if (ev.event == "SubagentStart") {
+            a.state       = AgentState::Running;
+            a.startedAtMs = ev.tsMs;
+        } else if (ev.event == "SubagentStop") {
+            a.state = AgentState::Finished;
+        } else if (ev.event == "PreToolUse") {
+            if (std::string line = toolLine(ev); !line.empty())
+                a.activity = std::move(line);
+            // A tool call is proof it was running at the time, and the log is
+            // walked forward, so a later Stop still wins.
+            if (a.state == AgentState::Spawned)
+                a.state = AgentState::Running;
+        }
+        return;
+    }
 
     // The log is in append order and no two sessions can reorder each other's
     // lines, so walking it forward and letting the last write win is the same
@@ -327,14 +494,8 @@ void applyEvent(Building& b, const AgentEvent& ev)
     // say, which is indistinguishable here from a detail that was lost. Either
     // way, blanking what the card already shows gains nothing.
     if (ev.event == "PreToolUse") {
-        std::string line = ev.tool;
-        if (!ev.detail.empty()) {
-            if (!line.empty())
-                line += "  ";
-            line += ev.detail;
-        }
-        if (!line.empty())
-            b.card.activity = line;
+        if (std::string line = toolLine(ev); !line.empty())
+            b.card.activity = std::move(line);
         b.notifying = false;
     } else if (ev.event == "UserPromptSubmit") {
         if (!ev.detail.empty())
@@ -347,6 +508,94 @@ void applyEvent(Building& b, const AgentEvent& ev)
     } else if (ev.event == "Stop") {
         b.notifying = false;
     }
+}
+
+// The file source names what a subagent is; the hooks say what it is doing. An
+// id seen only here therefore has a description and no state, which is exactly
+// what AgentState::Spawned means. Neither source overwrites the other: whoever
+// had something to say first keeps it.
+void applyFiles(Building& b, const SessionFiles& f)
+{
+    for (const SubAgent& meta : f.agents) {
+        SubAgent& a = b.agents[meta.id];
+        if (a.id.empty())
+            a.id = meta.id;
+        if (a.type.empty())
+            a.type = meta.type;
+        if (a.description.empty())
+            a.description = meta.description;
+        if (a.workflowRun.empty())
+            a.workflowRun = meta.workflowRun;
+        if (a.phase.empty())
+            a.phase = meta.phase;
+        if (a.startedAtMs == 0)
+            a.startedAtMs = meta.startedAtMs;
+
+        a.lastActivityMs = std::max(a.lastActivityMs, meta.startedAtMs);
+    }
+
+    b.card.workflows = f.workflows;
+}
+
+// Where the two sources meet.
+//
+// `dead` is a session whose process is gone. Nothing it started is still
+// running, whatever the last event said, and the same holds one level down: a
+// run that has ended is proof that every agent it spawned has ended, which is
+// the only way a subagent seen on disk alone ever leaves Spawned.
+void foldAgents(Building& b, bool dead)
+{
+    std::unordered_map<std::string, std::size_t> runs;
+    for (std::size_t i = 0; i < b.card.workflows.size(); ++i)
+        runs.emplace(b.card.workflows[i].runId, i);
+
+    // The phase of the most recently spawned agent, which is as close as either
+    // file gets to saying which phase a run has reached.
+    std::vector<std::int64_t> phaseAt(b.card.workflows.size(), 0);
+
+    b.card.agents.reserve(b.agents.size());
+    for (auto& [id, agent] : b.agents) {
+        const auto  at  = runs.find(agent.workflowRun);
+        WorkflowRun* run = (at == runs.end()) ? nullptr : &b.card.workflows[at->second];
+
+        if (dead || (run && run->finished()))
+            agent.state = AgentState::Finished;
+
+        if (run) {
+            ++run->spawned;
+            if (agent.state == AgentState::Running)
+                ++run->running;
+            if (!agent.phase.empty() && agent.startedAtMs >= phaseAt[at->second]) {
+                phaseAt[at->second] = agent.startedAtMs;
+                run->phase          = agent.phase;
+            }
+        }
+
+        b.card.agents.push_back(std::move(agent));
+    }
+
+    // Running first, because a card is read for what is happening now, then
+    // most recently active. The id breaks the tie so an unordered_map's own
+    // order never reaches the screen.
+    std::sort(b.card.agents.begin(), b.card.agents.end(),
+              [](const SubAgent& a, const SubAgent& c) {
+                  const bool ra = a.state == AgentState::Running;
+                  const bool rc = c.state == AgentState::Running;
+                  if (ra != rc)
+                      return ra;
+                  if (a.lastActivityMs != c.lastActivityMs)
+                      return a.lastActivityMs > c.lastActivityMs;
+                  return a.id < c.id;
+              });
+
+    std::sort(b.card.workflows.begin(), b.card.workflows.end(),
+              [](const WorkflowRun& a, const WorkflowRun& c) {
+                  if (a.finished() != c.finished())
+                      return c.finished();
+                  if (a.startedAtMs != c.startedAtMs)
+                      return a.startedAtMs > c.startedAtMs;
+                  return a.runId < c.runId;
+              });
 }
 
 int columnRank(AgentColumn c)
@@ -372,6 +621,16 @@ const char* columnLabel(AgentColumn c)
     case AgentColumn::Done:     return "DONE";
     }
     return "";
+}
+
+int AgentCard::looseAgents(AgentState state) const
+{
+    int n = 0;
+    for (const SubAgent& a : agents) {
+        if (a.workflowRun.empty() && a.state == state)
+            ++n;
+    }
+    return n;
 }
 
 const std::vector<AgentColumn>& columnOrder()
@@ -480,6 +739,9 @@ std::vector<AgentEvent> readEvents(const fs::path& eventLog, std::int64_t sinceM
             e.sessionId = stringField(&doc, "session");
             e.tool      = stringField(&doc, "tool");
             e.detail    = stringField(&doc, "detail");
+            e.agentId   = stringField(&doc, "agent");
+            e.agentType = stringField(&doc, "agentType");
+            e.toolUseId = stringField(&doc, "toolUse");
 
             const std::string cwd = stringField(&doc, "cwd");
             if (!cwd.empty())
@@ -491,10 +753,145 @@ std::vector<AgentEvent> readEvents(const fs::path& eventLog, std::int64_t sinceM
     return out;
 }
 
+// ------------------------------------------------------------ session files
+
+const fs::path& SessionFileReader::directoryFor(const std::string& sessionId,
+                                                const fs::path&    cwd)
+{
+    static const fs::path kNone;
+
+    if (const auto it = dirs_.find(sessionId); it != dirs_.end())
+        return it->second;
+
+    if (sessionId.empty() || cwd.empty())
+        return kNone;
+
+    const fs::path root = sessionDataRoot();
+    if (root.empty())
+        return kNone;
+
+    // The directory appears the first time a session spawns something, so a
+    // miss here is the ordinary state of a session that has not, and is not
+    // cached: the next refresh asks again and costs one is_directory call.
+    std::error_code ec;
+    fs::path        dir = root / widen(projectSlug(cwd)) / widen(sessionId);
+    if (!fs::is_directory(dir, ec))
+        return kNone;
+
+    return dirs_.emplace(sessionId, std::move(dir)).first->second;
+}
+
+SessionFiles SessionFileReader::read(const std::string& sessionId, const fs::path& cwd)
+{
+    SessionFiles out;
+    out.sessionId = sessionId;
+
+    const fs::path dir = directoryFor(sessionId, cwd);
+    if (dir.empty())
+        return out;
+
+    // The cache is what keeps this from being quadratic in a session's own
+    // history. Past the bound it is not helping any more, and holding it would
+    // just be a leak with a cache's name on it.
+    if (metas_.size() > kMaxCachedAgents)
+        metas_.clear();
+
+    const fs::path subagents = dir / "subagents";
+
+    // Loose subagents first, then one directory per workflow run. Both hold the
+    // same meta files; only the run directory says which run they belong to.
+    const auto collect = [&](const fs::path& from, const std::string& runId) {
+        std::error_code listing;
+        if (!fs::is_directory(from, listing))
+            return;
+
+        for (const auto& entry : fs::directory_iterator(from, listing)) {
+            if (listing)
+                break;
+
+            const std::string id = agentIdFromMeta(entry.path());
+            if (id.empty())
+                continue;
+
+            auto it = metas_.find(id);
+            if (it == metas_.end())
+                it = metas_.emplace(id, readAgentMeta(entry.path(), id, runId)).first;
+
+            out.agents.push_back(it->second);
+        }
+    };
+
+    collect(subagents, {});
+
+    std::error_code ec;
+    const fs::path  runs = subagents / "workflows";
+    if (fs::is_directory(runs, ec)) {
+        for (const auto& entry : fs::directory_iterator(runs, ec)) {
+            if (ec)
+                break;
+            if (entry.is_directory(ec))
+                collect(entry.path(), narrow(entry.path().filename().wstring()));
+        }
+    }
+
+    // A run is live from the moment its script lands and stays that way until
+    // the summary appears beside it, which is the only thing that ever carries
+    // a status. See the header: the summary is written at the end of the run,
+    // not during it.
+    const fs::path workflows = dir / "workflows";
+    const fs::path scripts   = workflows / "scripts";
+
+    std::error_code listing;
+    if (!fs::is_directory(scripts, listing))
+        return out;
+
+    for (const auto& entry : fs::directory_iterator(scripts, listing)) {
+        if (listing)
+            break;
+
+        WorkflowRun run;
+        if (!splitScriptName(entry.path(), &run.name, &run.runId))
+            continue;
+
+        run.status      = "running";
+        run.startedAtMs = fileWriteTimeMs(entry.path());
+
+        if (const auto it = finished_.find(run.runId); it != finished_.end()) {
+            out.workflows.push_back(it->second);
+            continue;
+        }
+
+        json::Value doc;
+        std::string error;
+        const std::string text =
+            readShared(workflows / widen(run.runId + ".json"), kMaxWorkflowBytes);
+
+        if (json::parse(text, &doc, &error) && doc.type == json::Value::Type::Object) {
+            const std::string status = anyString(&doc, "status");
+            if (!status.empty())
+                run.status = status;
+            if (const std::int64_t started = intField(&doc, "startTime"); started > 0)
+                run.startedAtMs = started;
+
+            // Terminal, so it cannot change again and the summary need never be
+            // parsed twice. It carries the whole script it ran, tens of
+            // kilobytes of it, and re-reading that every few seconds for every
+            // run a long session ever started is the one expensive thing here.
+            if (run.finished())
+                finished_.emplace(run.runId, run);
+        }
+
+        out.workflows.push_back(std::move(run));
+    }
+
+    return out;
+}
+
 // -------------------------------------------------------------------- board
 
 AgentList buildBoard(const std::vector<RegistryEntry>& registry,
                      const std::vector<AgentEvent>&    events,
+                     const std::vector<SessionFiles>&  files,
                      const ProjectList&                projects)
 {
     std::vector<Building>                        build;
@@ -538,6 +935,18 @@ AgentList buildBoard(const std::vector<RegistryEntry>& registry,
         applyEvent(build[it->second], ev);
     }
 
+    // Last, and only onto cards that already exist. A session's directory
+    // outlives the session, so a directory full of meta files is not evidence
+    // that anything is running and must never conjure a card of its own: the
+    // registry and the event log between them already know every session worth
+    // showing.
+    for (const SessionFiles& f : files) {
+        if (f.sessionId.empty())
+            continue;
+        if (const auto it = byKey.find(f.sessionId); it != byKey.end())
+            applyFiles(build[it->second], f);
+    }
+
     const std::vector<ProjectKey> keys = projectKeys(projects);
 
     AgentList cards;
@@ -579,6 +988,8 @@ AgentList buildBoard(const std::vector<RegistryEntry>& registry,
 
         c.project = projectNameFor(c.cwd, keys);
 
+        foldAgents(b, c.column == AgentColumn::Done);
+
         cards.push_back(std::move(c));
     }
 
@@ -614,6 +1025,14 @@ fs::path sessionRegistryDir()
     if (profile.empty())
         return {};
     return profile / ".claude" / "sessions";
+}
+
+fs::path sessionDataRoot()
+{
+    const fs::path profile = knownFolder(FOLDERID_Profile);
+    if (profile.empty())
+        return {};
+    return profile / ".claude" / "projects";
 }
 
 } // namespace pm::gui

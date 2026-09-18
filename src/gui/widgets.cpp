@@ -4,6 +4,7 @@
 #include "theme_qt.h"
 
 #include <QLinearGradient>
+#include <QMouseEvent>
 #include <QPainter>
 
 namespace pm::gui {
@@ -35,6 +36,55 @@ TrackedLabel::TrackedLabel(const QString& text, int px, int weight, qreal em,
 }
 
 void TrackedLabel::setText(const QString& text) { QLabel::setText(text.toUpper()); }
+
+// -------------------------------------------------------------------- TabLabel
+
+TabLabel::TabLabel(const QString& text, QWidget* parent)
+    : TrackedLabel(text, 15, QFont::Bold, 0.18, parent), base_(text)
+{
+    setCursor(Qt::PointingHandCursor);
+    restyle();
+}
+
+void TabLabel::setActive(bool active)
+{
+    if (active_ == active)
+        return;
+    active_ = active;
+    restyle();
+}
+
+void TabLabel::setBadge(int n)
+{
+    if (badge_ == n)
+        return;
+    badge_ = n;
+    restyle();
+}
+
+void TabLabel::mousePressEvent(QMouseEvent* e)
+{
+    TrackedLabel::mousePressEvent(e);
+    emit clicked();
+}
+
+void TabLabel::restyle()
+{
+    // The badge is part of the text rather than a second widget: it appears and
+    // disappears as sessions do, and a layout that reflows every time one lands
+    // would move the other tab sideways under the pointer.
+    QString text = base_;
+    if (badge_ > 0)
+        text += QStringLiteral(" %1").arg(badge_);
+    TrackedLabel::setText(text);
+
+    // Red on the tab you are on, and red on a tab that is asking for something
+    // whether or not you are on it. Those are the two things worth the accent,
+    // and a tab that is both is already red.
+    const bool accent = active_ || badge_ > 0;
+    setStyleSheet(QStringLiteral("color: %1;")
+                      .arg(theme::c(accent ? kRed : kFg4).name()));
+}
 
 // --------------------------------------------------------------------- TopRule
 

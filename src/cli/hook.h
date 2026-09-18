@@ -43,7 +43,20 @@ namespace pm::cli {
 //              PreToolUse         claude::toolSummary of tool_input
 //              Notification       message: what it is asking for
 //              Stop               empty
+//              SubagentStart      empty; agentType carries it
+//              SubagentStop       empty
 //              SessionEnd         reason
+//
+//   agent      agent_id, present on anything a SUBAGENT did
+//   agentType  agent_type: "Explore", "workflow-subagent", a named agent
+//   toolUse    tool_use_id, PreToolUse only
+//
+// Those last three are why the board can tell a session's own work from its
+// subagents'. A subagent runs under its parent's session_id and reports its
+// tool calls through the same hooks, so without agent_id a card shows whichever
+// of five subagents called a tool last as what the session itself is doing.
+// Verified on CLI 2.1.276, where the parent's own spawn call is tool_name
+// "Agent" and carries no agent_id.
 //
 // Keys are omitted when empty rather than written as "". src/gui/agent_board.h
 // declares the reading half and the two must agree.

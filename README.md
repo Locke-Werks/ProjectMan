@@ -59,9 +59,15 @@ If it is not installed at all, ProjectMan offers the download.
 
 ## Agents
 
-`Ctrl+B`, or the AGENTS button, opens a board of every Claude Code session on
-the machine: one card each, sorted into NEEDS YOU, WORKING, IDLE and DONE, and
-moving as the sessions move rather than when you rescan. Desktop only.
+The desktop app has two tabs, `// PROJECTS` and `// AGENTS`, and the second one
+is a board of every Claude Code session on the machine: one card each, sorted
+into NEEDS YOU, WORKING, IDLE and DONE, and moving as the sessions move rather
+than when you rescan. `Ctrl+B` switches between the two. Desktop only.
+
+It is a tab rather than a window because the board is watching whether or not
+you are looking at it, and the number of sessions waiting on you rides on the
+AGENTS tab itself. From the project list you can see that something is asking
+for you without going to look.
 
 The column comes from the session registry Claude Code keeps for itself at
 `~/.claude/sessions/<pid>.json`, one file per running process. That is the only
@@ -78,11 +84,39 @@ Code's hooks, and needs registering once:
 pm hook install
 ```
 
-That writes six entries into `~/.claude/settings.json`, merging with whatever is
-already there and tagging each one, so `pm hook uninstall` takes back exactly its
-own and leaves every other hook alone. `pm hook status` says which state you are
-in. Without it the board still works, from the registry alone: you see who is
-alive and who needs you, but not what any of them is doing.
+That writes eight entries into `~/.claude/settings.json`, merging with whatever
+is already there and tagging each one, so `pm hook uninstall` takes back exactly
+its own and leaves every other hook alone. `pm hook status` says which state you
+are in, and names any event a newer ProjectMan registers that your install is
+missing. Without it the board still works, from the registry alone: you see who
+is alive and who needs you, but not what any of them is doing.
+
+## Subagents and workflows
+
+A card also carries what the session is running underneath itself. A subagent is
+not a card of its own: it has no process, no window and no prompt to answer, so
+there is nothing FOCUS, ENGAGE or DISPATCH could aim at. It belongs to the
+session that can be acted on.
+
+A subagent keeps its parent's session id and reports its tool calls through the
+same hooks, so telling the two apart needs `agent_id`, which every event fired
+inside one carries. Without reading it a card shows whichever of five subagents
+called a tool last as what the session itself is doing. The card now shows the
+session's own work on its own line and each subagent on one of its own,
+brightest while it is running.
+
+A Workflow tool run appears as one line: its name, the phase it has reached, and
+how many of its agents are running out of how many it has started. Those come
+from two files Claude Code writes beside the session, and the split between them
+decides what can be known. The script lands when the run starts, so the name and
+the run are visible immediately. The summary, which is the only thing carrying a
+status, is written when the run ends, so `completed` or `killed` arrives at the
+end and not before.
+
+Only `SubagentStop` says a subagent has finished. Nothing on disk does: the file
+Claude Code writes when one spawns is never rewritten. So with no hooks
+registered a subagent line is dimmed and says on hover that it was seen to start
+and nothing more, rather than implying it is still going.
 
 The board only reports. ENGAGE, CONTINUE and DISPATCH are the same launches the
 project list offers, aimed at the session's repository. FOCUS raises the window a
@@ -205,7 +239,7 @@ Every action is Ctrl-modified, because bare letters go to the filter.
 | Ctrl+T | open a plain shell |
 | Shift+Enter, Ctrl+Shift+T | the same, in a loose window rather than the dock |
 | Ctrl+D | dispatch |
-| Ctrl+B | the agent board (desktop only) |
+| Ctrl+B | switch between the PROJECTS and AGENTS tabs (desktop only) |
 | F2 | settings (Ctrl+, in the desktop app) |
 | F5 | rescan |
 | Ctrl+Q | quit |
@@ -287,6 +321,11 @@ The agent board needs a Claude Code that publishes its session registry, which
 2.1.270 does. An older one that does not leaves the board empty until
 `pm hook install`, after which it fills from the hooks instead, without the
 columns the registry decides.
+
+Subagent lines need a Claude Code that puts `agent_id` on a hook payload and
+fires `SubagentStart` and `SubagentStop`, which 2.1.276 does. Workflow lines
+need no hooks at all, and neither costs anything else on the board when it is
+absent.
 
 ## Building
 

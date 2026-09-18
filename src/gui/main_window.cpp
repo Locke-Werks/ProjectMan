@@ -1,6 +1,6 @@
 #include "main_window.h"
 
-#include "agent_board_window.h"
+#include "agent_board_panel.h"
 #include "discovery.h"
 #include "dispatch_run_window.h"
 #include "dock.h"
@@ -31,6 +31,7 @@
 #include <QShortcut>
 #include <QSpinBox>
 #include <QSplitter>
+#include <QStackedWidget>
 #include <QTableView>
 #include <QTableWidget>
 #include <QVBoxLayout>
@@ -687,17 +688,31 @@ MainWindow::MainWindow(Config cfg, QWidget* parent)
 
     root->addWidget(new TopRule);
 
+    // The head row is the tab bar. Both tabs sit where the section eyebrow used
+    // to, because that is exactly what they replaced: a line naming which
+    // screen this is now says which screens there are.
     auto* head = new QHBoxLayout;
     head->setContentsMargins(18, 12, 18, 10);
-    eyebrow_ = new TrackedLabel(QStringLiteral("// Projects"), 15, QFont::Bold, 0.18);
-    eyebrow_->setStyleSheet(
-        QStringLiteral("color: %1;").arg(theme::c(kRed).name()));
-    head->addWidget(eyebrow_);
+
+    projectsTab_ = new TabLabel(QStringLiteral("// Projects"));
+    agentsTab_   = new TabLabel(QStringLiteral("// Agents"));
+    agentsTab_->setToolTip(QStringLiteral("Every Claude Code session on this machine"));
+    head->addWidget(projectsTab_);
+    head->addSpacing(18);
+    head->addWidget(agentsTab_);
+
     head->addStretch(1);
     counts_ = caption(QStringLiteral("scanning"), kFg4, 11);
     counts_->setFont(theme::mono(11));
     head->addWidget(counts_);
     root->addLayout(head);
+
+    // One page per tab. The filter belongs to the project list rather than to
+    // the window, so it goes inside the page and leaves with it.
+    auto* projectsPage = new QWidget;
+    auto* projectsBox  = new QVBoxLayout(projectsPage);
+    projectsBox->setContentsMargins(0, 0, 0, 0);
+    projectsBox->setSpacing(0);
 
     filter_ = new QLineEdit;
     filter_->setObjectName(QStringLiteral("Filter"));
@@ -706,7 +721,7 @@ MainWindow::MainWindow(Config cfg, QWidget* parent)
     auto* filterWrap = new QHBoxLayout;
     filterWrap->setContentsMargins(18, 0, 18, 12);
     filterWrap->addWidget(filter_);
-    root->addLayout(filterWrap);
+    projectsBox->addLayout(filterWrap);
 
     auto* split = new QSplitter(Qt::Horizontal);
 
@@ -775,15 +790,10 @@ MainWindow::MainWindow(Config cfg, QWidget* parent)
     sessions_ = new QPushButton(QStringLiteral("SESSIONS"));
     terminal_ = new QPushButton(QStringLiteral("TERMINAL"));
     dispatch_ = new QPushButton(QStringLiteral("DISPATCH"));
-    agents_   = new QPushButton(QStringLiteral("AGENTS"));
     engage_->setObjectName(QStringLiteral("Primary"));
 
-    // The board is about every session on the machine, not the selected row, so
-    // it stays enabled whatever the table is doing.
-    agents_->setToolTip(QStringLiteral("Every Claude Code session on this machine"));
-
     for (QPushButton* b : { engage_, resume_, sessions_, terminal_, dispatch_,
-                            agents_, settingsBtn_ })
+                            settingsBtn_ })
         b->setFont(theme::tracked(11, QFont::Bold, 0.14));
 
     dl->addWidget(engage_);
@@ -795,7 +805,6 @@ MainWindow::MainWindow(Config cfg, QWidget* parent)
     row3->addWidget(terminal_);
     row3->addWidget(dispatch_);
     dl->addLayout(row3);
-    dl->addWidget(agents_);
     dl->addWidget(settingsBtn_);
 
     // Where a launch lands, and the only place the dock is named now that
@@ -809,7 +818,17 @@ MainWindow::MainWindow(Config cfg, QWidget* parent)
     split->setStretchFactor(0, 3);
     split->setStretchFactor(1, 2);
     split->setSizes({ 780, 480 });
-    root->addWidget(split, 1);
+    projectsBox->addWidget(split, 1);
+
+    // Built now rather than on first use. Its watcher is what puts the count of
+    // waiting sessions on the AGENTS tab, and a board that only starts watching
+    // once someone opens it can never have told them to.
+    board_ = new AgentBoardPanel(model_->projects(), this);
+
+    pages_ = new QStackedWidget;
+    pages_->addWidget(projectsPage);
+    pages_->addWidget(board_);
+    root->addWidget(pages_, 1);
 
     grain_ = new GrainOverlay(central);
     grain_->raise();
@@ -836,8 +855,38 @@ MainWindow::MainWindow(Config cfg, QWidget* parent)
     connect(sessions_, &QPushButton::clicked, this, [this] { launch(LaunchMode::Resume); });
     connect(terminal_, &QPushButton::clicked, this, &MainWindow::openTerminal);
     connect(dispatch_, &QPushButton::clicked, this, &MainWindow::openDispatch);
-    connect(agents_, &QPushButton::clicked, this, &MainWindow::openBoard);
     connect(settingsBtn_, &QPushButton::clicked, this, &MainWindow::openSettings);
+
+    connect(projectsTab_, &TabLabel::clicked, this, [this] { showTab(Tab::Projects); });
+    connect(agentsTab_, &TabLabel::clicked, this, [this] { showTab(Tab::Agents); });
+
+    connect(board_, &AgentBoardPanel::attentionChanged, agentsTab_, &TabLabel::setBadge);
+    connect(board_, &AgentBoardPanel::countsChanged, this, [this](const QString& text) {
+        agentCounts_ = text;
+        if (tab_ == Tab::Agents)
+            counts_->setText(text);
+    });
+
+    // The board decides nothing about how a session starts. It names a
+    // directory and this answers with the same launch the project list would
+    // have made, so the dock, the autonomy ladder and Shift keep being decided
+    // in one place.
+    connect(board_, &AgentBoardPanel::focusRequested, this,
+            [](unsigned long pid) { raiseSessionWindow(pid); });
+    connect(board_, &AgentBoardPanel::engageRequested, this, [this](const fs::path& cwd) {
+        LaunchSpec s;
+        s.cwd  = cwd;
+        s.mode = LaunchMode::New;
+        launchSpec(s, nullptr);
+    });
+    connect(board_, &AgentBoardPanel::continueRequested, this, [this](const fs::path& cwd) {
+        LaunchSpec s;
+        s.cwd  = cwd;
+        s.mode = LaunchMode::Continue;
+        launchSpec(s, nullptr);
+    });
+    connect(board_, &AgentBoardPanel::dispatchRequested, this,
+            [this](const fs::path& cwd) { openDispatchFor(cwd); });
 
     // The same bindings as the console front end, so muscle memory carries
     // between the two. Ctrl-modified throughout, because the filter box owns
@@ -854,13 +903,17 @@ MainWindow::MainWindow(Config cfg, QWidget* parent)
                   [this] { launch(LaunchMode::Resume); });
     new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_T), this,
                   [this] { openTerminal(); });
+    // Ctrl+B goes to the board and back rather than only to it. It used to open
+    // a window, where pressing it again on the window already in front had
+    // nothing left to do.
     new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_B), this,
-                  [this] { openBoard(); });
+                  [this] { showTab(tab_ == Tab::Agents ? Tab::Projects : Tab::Agents); });
     new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_Comma), this,
                   [this] { openSettings(); });
 
     refreshDockNote();
     onSelectionChanged();
+    showTab(Tab::Projects);
     scan_->start(cfg_);
 }
 
@@ -895,12 +948,12 @@ void MainWindow::closeEvent(QCloseEvent* e)
             run->stopNow();
     }
 
-    // Closed rather than left to the child teardown, because its destructor is
+    // Shut down here rather than left to the child teardown, because that is
     // what joins the watcher thread. A thread still waiting on
     // ReadDirectoryChangesW after the event loop has gone is an app that never
     // finishes exiting.
-    if (boardWindow_)
-        boardWindow_->close();
+    if (board_)
+        board_->shutdown();
 
     e->accept();
 }
@@ -913,10 +966,13 @@ void MainWindow::onRowReady(int row, pm::Project project)
 
 void MainWindow::onSweepFinished(int probed, int failed, double seconds)
 {
-    counts_->setText(QStringLiteral("%1 probed  %2 failed  %3 s")
+    projectCounts_ = QStringLiteral("%1 probed  %2 failed  %3 s")
                          .arg(probed)
                          .arg(failed)
-                         .arg(seconds, 0, 'f', 2));
+                         .arg(seconds, 0, 'f', 2);
+    if (tab_ == Tab::Projects)
+        counts_->setText(projectCounts_);
+
     updateCounts();
     feedBoard();
 }
@@ -929,10 +985,12 @@ void MainWindow::updateCounts()
             ++dirty;
         open += p.open.total();
     }
-    counts_->setText(QStringLiteral("%1 projects   %2 dirty   %3 open")
+    projectCounts_ = QStringLiteral("%1 projects   %2 dirty   %3 open")
                          .arg(model_->rowCount())
                          .arg(dirty)
-                         .arg(open));
+                         .arg(open);
+    if (tab_ == Tab::Projects)
+        counts_->setText(projectCounts_);
 }
 
 const Project* MainWindow::current() const
@@ -1154,48 +1212,28 @@ void MainWindow::openDispatchFor(const fs::path& cwd)
     run->show();
 }
 
-void MainWindow::openBoard()
+void MainWindow::showTab(Tab tab)
 {
-    if (boardWindow_) {
-        boardWindow_->show();
-        boardWindow_->raise();
-        boardWindow_->activateWindow();
-        return;
-    }
+    tab_ = tab;
 
-    auto* board = new AgentBoardWindow(model_->projects(), this);
-    boardWindow_ = board;
+    const bool agents = tab == Tab::Agents;
+    pages_->setCurrentIndex(agents ? 1 : 0);
+    projectsTab_->setActive(!agents);
+    agentsTab_->setActive(agents);
+    counts_->setText(agents ? agentCounts_ : projectCounts_);
 
-    // The board decides nothing about how a session starts. It names a
-    // directory and the answer comes back through the same launch path the
-    // buttons use, so the dock, the autonomy ladder and the Shift override stay
-    // settled in one place.
-    connect(board, &AgentBoardWindow::focusRequested, this,
-            [](unsigned long pid) { raiseSessionWindow(pid); });
-    connect(board, &AgentBoardWindow::engageRequested, this,
-            [this](pm::fs::path cwd) {
-                LaunchSpec s;
-                s.cwd  = std::move(cwd);
-                s.mode = LaunchMode::New;
-                launchSpec(s, nullptr);
-            });
-    connect(board, &AgentBoardWindow::continueRequested, this,
-            [this](pm::fs::path cwd) {
-                LaunchSpec s;
-                s.cwd  = std::move(cwd);
-                s.mode = LaunchMode::Continue;
-                launchSpec(s, nullptr);
-            });
-    connect(board, &AgentBoardWindow::dispatchRequested, this,
-            [this](pm::fs::path cwd) { openDispatchFor(cwd); });
-
-    board->show();
+    // The filter box only exists on the project page, so the focus it was
+    // holding has to go somewhere that still takes keys.
+    if (agents)
+        board_->setFocus();
+    else
+        filter_->setFocus();
 }
 
 void MainWindow::feedBoard()
 {
-    if (boardWindow_)
-        boardWindow_->setProjects(model_->projects());
+    if (board_)
+        board_->setProjects(model_->projects());
 }
 
 void MainWindow::onDetailReady(quint64 token, pm::git::RepoDetail d)
