@@ -3,8 +3,8 @@
 #
 # installer.toml carries the same number and CI asserts the two agree, because
 # Forge stamps the installer from the TOML and cannot see this file.
-set(PM_VERSION_MAJOR 0)
-set(PM_VERSION_MINOR 9)
+set(PM_VERSION_MAJOR 1)
+set(PM_VERSION_MINOR 0)
 set(PM_VERSION_PATCH 0)
 
 set(PM_VERSION "${PM_VERSION_MAJOR}.${PM_VERSION_MINOR}.${PM_VERSION_PATCH}")
