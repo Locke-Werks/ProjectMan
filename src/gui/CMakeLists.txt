@@ -10,6 +10,8 @@ qt_add_executable(ProjectMan WIN32
     dispatch_run_window.cpp
     agent_board.cpp
     agent_board_panel.cpp
+    node_graph.cpp
+    node_explorer_panel.cpp
     main_window.cpp
     resources.qrc
     "${PM_GUI_RC}"

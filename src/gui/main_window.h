@@ -31,7 +31,9 @@ Q_DECLARE_METATYPE(pm::Project)
 namespace pm::gui {
 
 class AgentBoardPanel;
+class BoardController;
 class GrainOverlay;
+class NodeExplorerPanel;
 class ProjectFilterProxy;
 class ProjectModel;
 class TabLabel;
@@ -203,13 +205,18 @@ private:
 
     void openSettings();
 
-    // Which of the two tabs is showing. The board keeps watching either way:
-    // that is what puts a live count on the tab you are not on.
-    enum class Tab { Projects, Agents };
+    // Which tab is showing. The watcher runs whichever it is: that is what puts
+    // a live count on the tab you are not on.
+    enum class Tab { Projects, Agents, Nodes };
+    static constexpr int kTabCount = 3;
     void showTab(Tab tab);
 
-    // Hands the board the scan's latest result, which its cards take their
-    // project names from. Called on every sweep and enrich.
+    // The counts slot is one label shared by every tab, so each tab's text is
+    // kept and only the current one is written.
+    void setCounts(Tab which, const QString& text);
+
+    // Hands the watcher the scan's latest result, which the board's cards take
+    // their project names from. Called on every sweep and enrich.
     void feedBoard();
 
     void updateCounts();
@@ -223,15 +230,16 @@ private:
     QTableView*     table_ = nullptr;
     QLineEdit*      filter_ = nullptr;
     QStackedWidget* pages_  = nullptr;
+    QWidget*        projectsPage_ = nullptr;
     TabLabel*       projectsTab_ = nullptr;
     TabLabel*       agentsTab_   = nullptr;
+    TabLabel*       nodesTab_    = nullptr;
     QLabel*         counts_ = nullptr;
     GrainOverlay*   grain_  = nullptr;
 
-    // One counts slot, two tabs. Each side keeps its own text so switching back
-    // does not show the other tab's numbers until the next sweep.
-    QString projectCounts_;
-    QString agentCounts_;
+    // One counts slot, three tabs. Each keeps its own text so switching back
+    // does not show another tab's numbers until the next sweep.
+    QString tabCounts_[kTabCount];
     Tab     tab_ = Tab::Projects;
 
     QLabel* detailName_   = nullptr;
@@ -247,9 +255,15 @@ private:
     QPushButton* dispatch_ = nullptr;
     QPushButton* settingsBtn_ = nullptr;
 
-    // Built at startup and never destroyed before the window, so its watcher is
-    // running from launch rather than from the first time the tab is opened.
-    AgentBoardPanel* board_ = nullptr;
+    // Created before either panel, so QObject child deletion joins its worker
+    // before anything the worker posts into is destroyed. Started at launch
+    // rather than on the first tab switch: a watcher that only starts once
+    // someone opens the board can never have told them to.
+    BoardController* watch_ = nullptr;
+
+    // Two views of what that one watcher produces.
+    AgentBoardPanel*   board_ = nullptr;
+    NodeExplorerPanel* nodes_ = nullptr;
 
     QLabel* dockNote_ = nullptr;
 

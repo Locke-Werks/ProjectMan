@@ -53,10 +53,21 @@ constexpr std::int64_t kMaxMetaBytes = 64 * 1024;
 // the board will parse rather than a size anything is expected to reach.
 constexpr std::int64_t kMaxWorkflowBytes = 4 * 1024 * 1024;
 
+// A run journal carries each agent's whole result, so it is the script's output
+// rather than its text: 800KB for the largest here, a security review that ran
+// 43 agents. Same bound for the same reason. Past it the oldest records go, and
+// the agents they started are still accounted for by their meta files.
+constexpr std::int64_t kMaxJournalBytes = 4 * 1024 * 1024;
+
 // One session that spawned more subagents than this has outrun what a card can
 // usefully say, and the cache stops being a cache. Every run here fits inside
 // it by two orders of magnitude; the largest ever seen was 173.
 constexpr std::size_t kMaxCachedAgents = 20000;
+
+// The same, for journals. Far lower because a run holds many agents and this
+// machine's entire history is 19 runs: a map past this size is one that has
+// stopped being about anything still on screen.
+constexpr std::size_t kMaxCachedRuns = 512;
 
 // The tail of a file, read without taking it away from whoever is writing it.
 //
@@ -269,6 +280,93 @@ SubAgent readAgentMeta(const fs::path& file, std::string id, std::string runId)
     a.description = anyString(&doc, "description");
     a.phase       = anyString(&doc, "workflowPhase");
     return a;
+}
+
+// Forward only, so the source that knows more decides and the order two sources
+// are read in cannot change the answer.
+void promote(AgentState* state, AgentState to)
+{
+    if (state && *state < to)
+        *state = to;
+}
+
+// One workflow run's journal.jsonl, the run's own account of its agents.
+//
+// It is the only thing that says what a run is doing while it is doing it: the
+// summary beside it carries far more, per-agent state and last tool and all,
+// and is not written until the run has ended. It is also the only source that
+// says so with no hooks installed at all.
+//
+// Four record types on 2.1.276, none of them timestamped:
+//
+//   launched   the run began. Nothing else in it.
+//   started    agentId, plus the label and phase the script gave that agent.
+//   result     agentId, plus everything the agent returned.
+//   failed     agentId, and nothing about why.
+//
+// `launched` appears in 9 of the 19 runs on this machine, so it arrived at some
+// point and older runs do without it. Treat every type as optional, and an
+// unrecognised one as something new rather than as an error: a record naming an
+// agent is worth filing even when what it says is not understood.
+std::vector<SubAgent> readJournal(const fs::path& file, const std::string& runId)
+{
+    std::vector<SubAgent> out;
+
+    const std::string text = readShared(file, kMaxJournalBytes);
+    if (text.empty())
+        return out;
+
+    // Linear, because a run's agents are counted in tens: the largest here is
+    // 43, and the largest ever seen anywhere is 173.
+    const auto find = [&out](const std::string& id) -> SubAgent* {
+        for (SubAgent& a : out) {
+            if (a.id == id)
+                return &a;
+        }
+        return nullptr;
+    };
+
+    for (const std::string_view raw : splitLines(text)) {
+        const std::string_view line = trim(raw);
+        if (line.empty())
+            continue;
+
+        // A line caught between the write and the newline, or a result too
+        // large for the cap to have kept whole. Skipping it costs one agent's
+        // state until the next refresh reads the file again.
+        json::Value doc;
+        std::string error;
+        if (!json::parse(line, &doc, &error) || doc.type != json::Value::Type::Object)
+            continue;
+
+        const std::string id = stringField(&doc, "agentId");
+        if (id.empty())
+            continue;   // "launched", and anything else about the run itself
+
+        SubAgent* a = find(id);
+        if (!a) {
+            out.emplace_back();
+            a              = &out.back();
+            a->id          = id;
+            a->workflowRun = runId;
+            a->type        = "workflow-subagent";
+        }
+
+        const std::string type = stringField(&doc, "type");
+        if (type == "started") {
+            promote(&a->state, AgentState::Running);
+            if (std::string label = anyString(&doc, "label"); !label.empty())
+                a->description = std::move(label);
+            if (std::string phase = anyString(&doc, "phase"); !phase.empty())
+                a->phase = std::move(phase);
+        } else if (type == "result") {
+            promote(&a->state, AgentState::Finished);
+        } else if (type == "failed") {
+            promote(&a->state, AgentState::Finished);
+            a->failed = true;
+        }
+    }
+    return out;
 }
 
 // -------------------------------------------------------------- still alive
@@ -527,6 +625,11 @@ void applyEvent(Building& b, const AgentEvent& ev)
 // id seen only here therefore has a description and no state, which is exactly
 // what AgentState::Spawned means. Neither source overwrites the other: whoever
 // had something to say first keeps it.
+//
+// State is the exception, and only because it cannot be written backwards:
+// inside a workflow the files do know when an agent started and stopped, and
+// what they know is folded in rather than dropped. A hook that saw the same
+// agent finish still wins, because finishing is as far as it goes.
 void applyFiles(Building& b, const SessionFiles& f)
 {
     for (const SubAgent& meta : f.agents) {
@@ -544,6 +647,9 @@ void applyFiles(Building& b, const SessionFiles& f)
         if (a.startedAtMs == 0)
             a.startedAtMs = meta.startedAtMs;
 
+        promote(&a.state, meta.state);
+        a.failed = a.failed || meta.failed;
+
         a.lastActivityMs = std::max(a.lastActivityMs, meta.startedAtMs);
     }
 
@@ -554,8 +660,8 @@ void applyFiles(Building& b, const SessionFiles& f)
 //
 // `dead` is a session whose process is gone. Nothing it started is still
 // running, whatever the last event said, and the same holds one level down: a
-// run that has ended is proof that every agent it spawned has ended, which is
-// the only way a subagent seen on disk alone ever leaves Spawned.
+// run that has ended is proof that every agent it spawned has ended, whatever
+// its journal got as far as recording.
 void foldAgents(Building& b, bool dead)
 {
     std::unordered_map<std::string, std::size_t> runs;
@@ -576,8 +682,10 @@ void foldAgents(Building& b, bool dead)
 
         if (run) {
             ++run->spawned;
-            if (agent.state == AgentState::Running)
-                ++run->running;
+            if (agent.state == AgentState::Finished)
+                ++run->done;
+            if (agent.failed)
+                ++run->failed;
             if (!agent.phase.empty() && agent.startedAtMs >= phaseAt[at->second]) {
                 phaseAt[at->second] = agent.startedAtMs;
                 run->phase          = agent.phase;
@@ -634,6 +742,20 @@ const char* columnLabel(AgentColumn c)
     case AgentColumn::Done:     return "DONE";
     }
     return "";
+}
+
+std::string agentLabel(const SubAgent& a)
+{
+    // Inside a workflow every agent is typed "workflow-subagent", which says
+    // nothing the run it hangs off has not already said. The label the script
+    // gave it is the part that differs between them, and the run's journal is
+    // where that comes from.
+    std::string label = a.workflowRun.empty() ? a.type : a.description;
+    if (label.empty() && !a.workflowRun.empty())
+        label = a.phase;
+    if (label.empty())
+        label = a.type.empty() ? "agent" : a.type;
+    return label;
 }
 
 int AgentCard::looseAgents(AgentState state) const
@@ -794,6 +916,34 @@ const fs::path& SessionFileReader::directoryFor(const std::string& sessionId,
     return dirs_.emplace(sessionId, std::move(dir)).first->second;
 }
 
+// The journal is the one file here that is read again while it is still being
+// written, so the cache is keyed on its size rather than on its existence. A
+// run that has not started or finished an agent since the last refresh has not
+// touched it, and that is the common case: the file is reparsed when it grows
+// and not otherwise.
+const std::vector<SubAgent>& SessionFileReader::journalFor(const fs::path&    runDir,
+                                                           const std::string& runId)
+{
+    static const std::vector<SubAgent> kNone;
+
+    const fs::path file = runDir / "journal.jsonl";
+
+    // A run whose directory exists before its journal does, and every run from
+    // before the journal existed at all.
+    std::error_code      ec;
+    const std::uintmax_t size = fs::file_size(file, ec);
+    if (ec)
+        return kNone;
+
+    Journal& j = journals_[runId];
+    if (j.bytes == size)
+        return j.agents;
+
+    j.agents = readJournal(file, runId);
+    j.bytes  = size;
+    return j.agents;
+}
+
 SessionFiles SessionFileReader::read(const std::string& sessionId, const fs::path& cwd)
 {
     SessionFiles out;
@@ -808,6 +958,8 @@ SessionFiles SessionFileReader::read(const std::string& sessionId, const fs::pat
     // just be a leak with a cache's name on it.
     if (metas_.size() > kMaxCachedAgents)
         metas_.clear();
+    if (journals_.size() > kMaxCachedRuns)
+        journals_.clear();
 
     const fs::path subagents = dir / "subagents";
 
@@ -834,6 +986,30 @@ SessionFiles SessionFileReader::read(const std::string& sessionId, const fs::pat
         }
     };
 
+    // What the run's journal says about an agent, onto what its meta file said.
+    // The two are written by different halves of the same run and neither is
+    // complete: the meta file has the agent's type and spawn time and cannot
+    // say it ended, the journal has its label, its phase and its ending and
+    // does not always name it first. An agent in one and not the other is
+    // ordinary, so either may be the first to mention one.
+    const auto merge = [&out](const std::vector<SubAgent>& journal) {
+        for (const SubAgent& j : journal) {
+            const auto at = std::find_if(out.agents.begin(), out.agents.end(),
+                                         [&j](const SubAgent& a) { return a.id == j.id; });
+            if (at == out.agents.end()) {
+                out.agents.push_back(j);
+                continue;
+            }
+
+            promote(&at->state, j.state);
+            at->failed = at->failed || j.failed;
+            if (!j.description.empty())
+                at->description = j.description;   // the script's own label for it
+            if (at->phase.empty())
+                at->phase = j.phase;
+        }
+    };
+
     collect(subagents, {});
 
     std::error_code ec;
@@ -842,8 +1018,12 @@ SessionFiles SessionFileReader::read(const std::string& sessionId, const fs::pat
         for (const auto& entry : fs::directory_iterator(runs, ec)) {
             if (ec)
                 break;
-            if (entry.is_directory(ec))
-                collect(entry.path(), narrow(entry.path().filename().wstring()));
+            if (!entry.is_directory(ec))
+                continue;
+
+            const std::string runId = narrow(entry.path().filename().wstring());
+            collect(entry.path(), runId);
+            merge(journalFor(entry.path(), runId));
         }
     }
 

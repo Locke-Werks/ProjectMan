@@ -59,10 +59,11 @@ If it is not installed at all, ProjectMan offers the download.
 
 ## Agents
 
-The desktop app has two tabs, `// PROJECTS` and `// AGENTS`, and the second one
-is a board of every Claude Code session on the machine: one card each, sorted
-into NEEDS YOU, WORKING, IDLE and DONE, and moving as the sessions move rather
-than when you rescan. `Ctrl+B` switches between the two. Desktop only.
+The desktop app has three tabs, `// PROJECTS`, `// AGENTS` and
+`// NODE EXPLORER`. The second is a board of every Claude Code session on the
+machine: one card each, sorted into NEEDS YOU, WORKING, IDLE and DONE, and
+moving as the sessions move rather than when you rescan. `Ctrl+B` cycles the
+three. Desktop only.
 
 It is a tab rather than a window because the board is watching whether or not
 you are looking at it, and the number of sessions waiting on you rides on the
@@ -106,17 +107,22 @@ session's own work on its own line and each subagent on one of its own,
 brightest while it is running.
 
 A Workflow tool run appears as one line: its name, the phase it has reached, and
-how many of its agents are running out of how many it has started. Those come
-from two files Claude Code writes beside the session, and the split between them
-decides what can be known. The script lands when the run starts, so the name and
-the run are visible immediately. The summary, which is the only thing carrying a
-status, is written when the run ends, so `completed` or `killed` arrives at the
-end and not before.
+how many of its agents have finished out of how many it has started, counted the
+way Claude Code counts the same run in the session running it. Under it sit the
+agents that run still has going, each under the label its script gave it.
 
-Only `SubagentStop` says a subagent has finished. Nothing on disk does: the file
-Claude Code writes when one spawns is never rewritten. So with no hooks
-registered a subagent line is dimmed and says on hover that it was seen to start
-and nothing more, rather than implying it is still going.
+Three files Claude Code writes beside the session feed that, and the split
+between them decides what can be known. The script lands when the run starts, so
+the name and the run are visible immediately. The run's journal records each
+agent starting and returning, so the agents and the progress through them arrive
+while the run is going. The summary, which is the only thing carrying a status,
+is written when the run ends, so `completed` or `killed` arrives at the end and
+not before.
+
+Outside a run, only `SubagentStop` says a subagent has finished: the file Claude
+Code writes when one spawns is never rewritten. So with no hooks registered a
+loose subagent line is dimmed and says on hover that it was seen to start and
+nothing more, rather than implying it is still going.
 
 The board only reports. ENGAGE, CONTINUE and DISPATCH are the same launches the
 project list offers, aimed at the session's repository. FOCUS raises the window a
@@ -127,6 +133,22 @@ the session, and a dock column shares one window across every pane in it.
 Nothing here writes to Claude Code's own files. The registry is read, never
 touched, and the only file ProjectMan writes for this is its own event log under
 `%LOCALAPPDATA%\ProjectMan\agents`.
+
+## Node Explorer
+
+The same sessions, drawn as what they are: a live session is a large node, every
+workflow run and subagent under it is a smaller one tied to it, and the whole
+thing settles under repulsion and link tension. Work pops in when it starts and
+pops out when it ends, the rest slides out of the way, and the view zooms itself
+to keep the whole structure in frame.
+
+It is a view and nothing else. No panning, no zoom control, no selection, no
+menu: everything that can be acted on is a card on the AGENTS tab, and this
+answers the question that board cannot, which is what the shape of the work is.
+Sessions that have finished are not on it.
+
+One watcher feeds both tabs, so they cannot disagree about the same instant, and
+the canvas stops repainting entirely once the graph has settled.
 
 A session's name comes from Claude Code and changes as the work changes topic, so
 a card renames itself over a long session. The registry is undocumented and
@@ -239,7 +261,7 @@ Every action is Ctrl-modified, because bare letters go to the filter.
 | Ctrl+T | open a plain shell |
 | Shift+Enter, Ctrl+Shift+T | the same, in a loose window rather than the dock |
 | Ctrl+D | dispatch |
-| Ctrl+B | switch between the PROJECTS and AGENTS tabs (desktop only) |
+| Ctrl+B | cycle the PROJECTS, AGENTS and NODE EXPLORER tabs (desktop only) |
 | F2 | settings (Ctrl+, in the desktop app) |
 | F5 | rescan |
 | Ctrl+Q | quit |
@@ -323,9 +345,9 @@ The agent board needs a Claude Code that publishes its session registry, which
 columns the registry decides.
 
 Subagent lines need a Claude Code that puts `agent_id` on a hook payload and
-fires `SubagentStart` and `SubagentStop`, which 2.1.276 does. Workflow lines
-need no hooks at all, and neither costs anything else on the board when it is
-absent.
+fires `SubagentStart` and `SubagentStop`, which 2.1.276 does. Workflow lines,
+and the agents inside a run, need no hooks at all: the run's own journal carries
+them. Neither costs anything else on the board when it is absent.
 
 ## Building
 

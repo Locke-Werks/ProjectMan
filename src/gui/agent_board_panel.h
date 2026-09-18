@@ -7,7 +7,6 @@
 #include <QString>
 #include <QWidget>
 
-#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -30,6 +29,11 @@ class TrackedLabel;
 
 // Owns the thread that watches the board's two sources and rebuilds it.
 //
+// MainWindow owns one of these, the way it owns ScanController and
+// DetailController, and every view of the board is a receiver of the one
+// boardReady it emits. A second controller would be a second watcher thread, a
+// second SessionFileReader and a second set of file reads for the same bytes.
+//
 // Both sources are files other processes write, so there is nothing to
 // subscribe to: the session registry and the event log's directory are watched
 // with ReadDirectoryChangesW, and one WaitForMultipleObjects covers both of
@@ -47,11 +51,11 @@ public:
     explicit BoardController(QObject* parent = nullptr);
     ~BoardController() override;
 
-    // The scanned tree buildBoard takes project names from. It lands late and
-    // changes again at every sweep, so it is set rather than passed in: the
-    // worker copies the latest under the lock at the top of each rebuild, and
-    // setting it wakes the wait so new names appear now rather than at the next
-    // poll.
+    // The scanned tree buildBoard takes project names from, handed over by
+    // MainWindow::feedBoard on every sweep. It lands late and changes again at
+    // every sweep, so it is set rather than passed in: the worker copies the
+    // latest under the lock at the top of each rebuild, and setting it wakes
+    // the wait so new names appear now rather than at the next poll.
     void setProjects(ProjectList projects);
 
     void start();
@@ -61,7 +65,11 @@ public:
     void shutdown();
 
 signals:
-    void boardReady(pm::gui::AgentList board);
+    // By reference, and every receiver takes it by reference. The emit is
+    // arranged to happen on the GUI thread (see buildAndPost), so every
+    // connection from it is direct and the list is alive for the whole call:
+    // the board is built once, moved once, and copied only by whoever keeps it.
+    void boardReady(const pm::gui::AgentList& board);
 
 private:
     void run();
@@ -84,11 +92,16 @@ private:
 // Every Claude Code session on this machine, as four columns of cards that
 // follow the sessions as they move.
 //
-// A tab of the main window rather than a window of its own, and built once at
-// startup rather than on first use, so the watcher runs whether or not the tab
-// is showing. That is the point of it being a tab: the count of sessions
-// waiting on someone is on the tab itself, so the answer to "is anything
-// asking for me" does not require being on this tab to see.
+// A view over an AgentList it is handed and nothing more: it owns no source, no
+// thread and no files. MainWindow's BoardController is what feeds it, which is
+// also what feeds the node explorer, so the two tabs cannot disagree about the
+// same instant. The cost is that a panel nobody feeds shows four empty columns
+// for ever; what it buys is that one setBoard call with a list built in a test
+// draws the whole board with no registry, no event log and no thread.
+//
+// A tab of the main window rather than a window of its own. That is the point
+// of the count of waiting sessions riding on the tab itself: the answer to "is
+// anything asking for me" does not require being on this tab to see.
 //
 // The panel launches nothing. Each action emits and MainWindow answers, so the
 // dock, the autonomy ladder and the Shift override keep being decided in one
@@ -97,28 +110,19 @@ class AgentBoardPanel : public QWidget {
     Q_OBJECT
 
 public:
-    explicit AgentBoardPanel(ProjectList projects, QWidget* parent = nullptr);
-    ~AgentBoardPanel() override;
+    explicit AgentBoardPanel(QWidget* parent = nullptr);
 
-    // The scan's result, which cards take their project name from. MainWindow
-    // hands over a fresh one whenever a sweep finishes.
-    void setProjects(ProjectList projects);
-
-    // Stops the watcher thread and waits for it.
-    //
-    // Called from MainWindow::closeEvent rather than left to the destructor,
-    // because a thread still sitting in ReadDirectoryChangesW when the event
-    // loop has gone is a process that never exits. Safe to call twice.
-    void shutdown();
+    // The latest board, from MainWindow's BoardController.
+    void setBoard(const AgentList& board);
 
 signals:
-    // How many cards are in NEEDS YOU. MainWindow puts it on the tab, which is
-    // the whole reason the watcher keeps running while the tab is hidden.
+    // How many cards are in NEEDS YOU. MainWindow puts it on the AGENTS tab,
+    // which is the whole reason its watcher runs whichever tab is showing.
     void attentionChanged(int waiting);
 
     // "3 live  1 need you  5 agents", for the one counts slot in the main
-    // window's head row. Held there rather than repeated here, so the two tabs
-    // read as two views of one window instead of two windows in a stack.
+    // window's head row. Held there rather than repeated here, so every tab
+    // reads as a view of one window instead of a window in a stack.
     void countsChanged(QString summary);
 
     // Raise the session's own window. Live cards only: a card in Done carries a
@@ -133,7 +137,6 @@ protected:
     bool eventFilter(QObject* watched, QEvent* e) override;
 
 private:
-    void onBoardReady(AgentList board);
     void rebuildCards();
     void refreshActions();
     void setSelected(const QString& sessionId);
@@ -144,11 +147,6 @@ private:
 
     AgentList board_;
     QString   selected_;   // sessionId, so the selection survives a rebuild
-
-    // Destroyed before the widgets, which member order guarantees, and shut
-    // down first thing in the destructor: the watcher thread posts to it, and
-    // what it posts writes into these widgets.
-    std::unique_ptr<BoardController> watch_;
 
     std::vector<TrackedLabel*> heads_;     // one per column, in columnOrder()
     std::vector<QVBoxLayout*>  columns_;   // the same order; holds the cards

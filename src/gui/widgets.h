@@ -21,7 +21,7 @@ public:
 // A label rather than a QTabBar. The tabs sit in the head row where the section
 // eyebrow used to, in the same tracked caps, and Qt's tab chrome is a raised,
 // rounded, bordered thing that no amount of stylesheet turns back into a line
-// of text. Two tabs do not justify reimplementing one either.
+// of text. Three tabs do not justify reimplementing one either.
 class TabLabel : public TrackedLabel {
     Q_OBJECT
 public:
@@ -30,7 +30,8 @@ public:
     void setActive(bool active);
 
     // The count riding on the tab, which is how a session asking for something
-    // is seen from the other tab. Zero shows nothing at all rather than a zero.
+    // is seen from whichever tab you are on. Zero shows nothing at all rather
+    // than a zero.
     void setBadge(int n);
 
 signals:

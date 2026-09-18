@@ -180,33 +180,35 @@ constexpr int kMaxAgentLines    = 4;
 const char* const kNoStopEvent =
     "Seen to start. Only a hook says when a subagent ends: run `pm hook install`.";
 
+// Agents under a run are indented to say they belong to the line above.
+const char* const kNested = "  ";
+
 QString workflowLine(const WorkflowRun& w)
 {
     QString s = QString::fromStdString(w.name);
     if (!w.phase.empty())
         s += QStringLiteral("  ") + QString::fromStdString(w.phase);
 
+    // Done out of started, which is the way Claude Code counts the same run in
+    // the session it is running in. The board said the opposite for a while and
+    // the two could not be read side by side: 1 of 4 finished showed as 3/4.
+    s += QStringLiteral("  %1/%2").arg(w.done).arg(w.spawned);
+    if (w.failed > 0)
+        s += QStringLiteral("  %1 failed").arg(w.failed);
     if (w.finished())
-        s += QStringLiteral("  %1 %2").arg(w.spawned).arg(QString::fromStdString(w.status));
-    else if (w.running > 0)
-        s += QStringLiteral("  %1/%2").arg(w.running).arg(w.spawned);
-    else
-        s += QStringLiteral("  %1 agents").arg(w.spawned);
+        s += QStringLiteral("  ") + QString::fromStdString(w.status);
     return s;
 }
 
 QString agentLine(const SubAgent& a)
 {
-    // Inside a workflow every agent is typed "workflow-subagent", which says
-    // nothing the run's own line has not already said. The phase it was spawned
-    // into is the part that differs between them.
-    std::string label = a.workflowRun.empty() ? a.type : a.phase;
-    if (label.empty())
-        label = a.type.empty() ? "agent" : a.type;
+    const std::string label = agentLabel(a);
 
     // What it is doing beats what it was asked to do, and a subagent only has
     // the first once a hook has reported one of its tool calls.
-    const std::string detail = a.activity.empty() ? a.description : a.activity;
+    std::string detail = a.activity;
+    if (detail.empty() && label != a.description)
+        detail = a.description;
 
     QString s = QString::fromStdString(label);
     if (!detail.empty())
@@ -360,17 +362,21 @@ void BoardController::buildAndPost()
             files.push_back(sessions_.read(e.sessionId, e.cwd));
     }
 
-    const AgentList board = buildBoard(registry, events, files, projects);
+    AgentList board = buildBoard(registry, events, files, projects);
 
     // Emitted from inside the posted lambda, so the signal runs on the GUI
     // thread as a direct call and the list never crosses as a queued argument.
+    // Moved into the lambda and emitted by reference: with two panels on the
+    // far end, a by-value signal would copy the whole board three more times
+    // for nothing.
     QMetaObject::invokeMethod(
-        this, [this, board] { emit boardReady(board); }, Qt::QueuedConnection);
+        this, [this, board = std::move(board)] { emit boardReady(board); },
+        Qt::QueuedConnection);
 }
 
 // ------------------------------------------------------------ AgentBoardPanel
 
-AgentBoardPanel::AgentBoardPanel(ProjectList projects, QWidget* parent)
+AgentBoardPanel::AgentBoardPanel(QWidget* parent)
     : QWidget(parent)
 {
     auto* root = new QVBoxLayout(this);
@@ -461,35 +467,11 @@ AgentBoardPanel::AgentBoardPanel(ProjectList projects, QWidget* parent)
             emit dispatchRequested(c->cwd);
     });
     refreshActions();
-
-    watch_ = std::make_unique<BoardController>();
-    connect(watch_.get(), &BoardController::boardReady, this, &AgentBoardPanel::onBoardReady);
-    watch_->setProjects(std::move(projects));
-    watch_->start();
 }
 
-AgentBoardPanel::~AgentBoardPanel()
+void AgentBoardPanel::setBoard(const AgentList& board)
 {
-    // First, before any widget goes: the watcher posts to the controller, and
-    // what the controller posts rebuilds these columns.
-    shutdown();
-}
-
-void AgentBoardPanel::shutdown()
-{
-    if (watch_)
-        watch_->shutdown();
-}
-
-void AgentBoardPanel::setProjects(ProjectList projects)
-{
-    if (watch_)
-        watch_->setProjects(std::move(projects));
-}
-
-void AgentBoardPanel::onBoardReady(AgentList board)
-{
-    board_ = std::move(board);
+    board_ = board;
     rebuildCards();
     refreshActions();
 }
@@ -548,7 +530,7 @@ void AgentBoardPanel::rebuildCards()
 
     QString counts = QStringLiteral("%1 live  %2 need you").arg(live).arg(needs);
     if (agents > 0)
-        counts += QStringLiteral("  %1 agents").arg(agents);
+        counts += QStringLiteral("  %1 agent%2").arg(agents).arg(agents == 1 ? "" : "s");
     emit countsChanged(board_.empty() ? QStringLiteral("no sessions") : counts);
 
     // The tab wears this number, so it is the one thing here that has to reach
@@ -605,14 +587,49 @@ QFrame* AgentBoardPanel::buildCard(const AgentCard& card)
         cl->addWidget(prompt);
     }
 
-    // What the session has running underneath it: workflow runs first, since
-    // each one accounts for a block of the agents below it, then the agents
-    // themselves. A finished run stays on the card because the agents it
-    // accounts for are still being counted against it.
-    // Elided from the middle, not the right, on every line below here. These
-    // are a tool name followed by a path, and four subagents reading four files
-    // in one tree cut to four identical lines when the tail is the half thrown
-    // away. The run lines carry their counts at the end for the same reason.
+    // What the session has running underneath it: each workflow run, then the
+    // agents that run still has going, then any subagent outside a run. A
+    // finished run stays on the card because the agents it accounts for are
+    // still being counted against it, but it lists none of them: they are all
+    // over, and its own line says how many there were.
+    // Elided from the middle, not the right, on the run lines and on any agent
+    // outside one. These are a tool name followed by a path, and four subagents
+    // reading four files in one tree cut to four identical lines when the tail
+    // is the half thrown away. The run lines carry their counts at the end for
+    // the same reason. The agents inside a run are the exception, below.
+    int hidden = 0;
+    int budget = kMaxAgentLines;   // shared by every agent line below, run or not
+
+    const auto addAgent = [&](const SubAgent& a, bool nested) {
+        if (budget == 0) {
+            ++hidden;
+            return;
+        }
+
+        const bool running = a.state == AgentState::Running;
+        auto*      line    = cardLine(running ? kFg2 : kFg4, theme::mono(10));
+
+        QString text = agentLine(a);
+        if (nested)
+            text.prepend(QLatin1String(kNested));
+
+        // The exception to the middle-elide rule above, and for its own reason.
+        // A run's agents are told apart by the label the script gave them,
+        // which is at the front: four of them inside one phase differ there and
+        // often nowhere else, since what they are each running is a build of
+        // the same tree. Cutting from the right keeps the name and loses the
+        // end of the command, which is the right half to lose here.
+        setElided(line, text, nested ? Qt::ElideRight : Qt::ElideMiddle);
+
+        // Only true of a subagent nothing has spoken for. Inside a run the
+        // journal reports both ends, so a line there is never in that state.
+        if (!running && a.workflowRun.empty())
+            line->setToolTip(QString::fromLatin1(kNoStopEvent));
+
+        cl->addWidget(line);
+        --budget;
+    };
+
     int shown = 0;
     for (const WorkflowRun& w : card.workflows) {
         if (shown == kMaxWorkflowLines)
@@ -621,6 +638,13 @@ QFrame* AgentBoardPanel::buildCard(const AgentCard& card)
         setElided(line, workflowLine(w), Qt::ElideMiddle);
         cl->addWidget(line);
         ++shown;
+
+        if (w.finished())
+            continue;
+        for (const SubAgent& a : card.agents) {
+            if (a.workflowRun == w.runId && a.state != AgentState::Finished)
+                addAgent(a, true);
+        }
     }
     if (const int over = static_cast<int>(card.workflows.size()) - shown; over > 0) {
         auto* more = cardLine(kFg4, theme::mono(10));
@@ -628,25 +652,11 @@ QFrame* AgentBoardPanel::buildCard(const AgentCard& card)
         cl->addWidget(more);
     }
 
-    // Loose subagents only. One inside a workflow is already counted on its
-    // run's line, and listing it again would double every number on the card.
-    int agents = 0;
-    int hidden = 0;
+    // Then the ones belonging to no run. An agent inside one was listed under
+    // it above, and listing it again would double every number on the card.
     for (const SubAgent& a : card.agents) {
-        if (!a.workflowRun.empty() || a.state == AgentState::Finished)
-            continue;
-        if (agents == kMaxAgentLines) {
-            ++hidden;
-            continue;
-        }
-
-        const bool running = a.state == AgentState::Running;
-        auto*      line    = cardLine(running ? kFg2 : kFg4, theme::mono(10));
-        setElided(line, agentLine(a), Qt::ElideMiddle);
-        if (!running)
-            line->setToolTip(QString::fromLatin1(kNoStopEvent));
-        cl->addWidget(line);
-        ++agents;
+        if (a.workflowRun.empty() && a.state != AgentState::Finished)
+            addAgent(a, false);
     }
 
     const int done = card.looseAgents(AgentState::Finished);

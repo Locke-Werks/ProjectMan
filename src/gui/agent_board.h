@@ -28,9 +28,14 @@
 //                                   Claude Code's per-session files. Owns
 //                                   IDENTITY for the work inside a session: a
 //                                   subagent's type and description, and which
-//                                   workflow run and phase it belongs to. None
-//                                   of it says whether anything is still
-//                                   running, so it never decides state.
+//                                   workflow run and phase it belongs to.
+//                                   Nothing here says whether a session or a
+//                                   loose subagent is still running, with one
+//                                   exception: a workflow run's own journal
+//                                   records each of its agents starting and
+//                                   returning, so inside a run it does decide
+//                                   state, and is the only source that can
+//                                   without hooks installed.
 //
 // The one crossing: an unanswered Notification moves a card to NeedsYou whatever
 // the registry says, because a session waiting on a permission prompt still
@@ -111,11 +116,16 @@ struct AgentEvent {
 //
 // Deliberately not a bool. A meta file proves a subagent started and says
 // nothing about whether it ended, so "we saw it start" and "it is running right
-// now" are different claims and only hooks can make the second one.
+// now" are different claims. Two things make the second one: a hook, for any
+// subagent, and a workflow run's journal, for the agents inside that run.
+//
+// The values are in order of how much is known, and a subagent only ever moves
+// forward through them. Two sources reporting one agent therefore agree without
+// either having to win: whichever knows more decides.
 enum class AgentState {
-    Spawned,    // a meta file exists; no hook has spoken for it
-    Running,    // SubagentStart, and no SubagentStop yet
-    Finished,   // SubagentStop, or its workflow run ended
+    Spawned,    // a meta file exists; nothing has spoken for it since
+    Running,    // SubagentStart, or the run's journal started it
+    Finished,   // SubagentStop, a journal result, or its workflow run ended
 };
 
 struct SubAgent {
@@ -129,17 +139,32 @@ struct SubAgent {
     AgentState   state          = AgentState::Spawned;
     std::int64_t startedAtMs    = 0;
     std::int64_t lastActivityMs = 0;
+
+    // Its run's journal recorded it failing rather than returning. Finished
+    // either way: the run has stopped waiting on it.
+    bool failed = false;
 };
 
-// One Workflow tool run, folded from the two files it writes.
+// What to call one on screen: its script's own label inside a run, its type
+// outside one, and the best of what is left when neither is there. Here rather
+// than in a panel because two views that name the same agent differently are
+// two views of two different things.
+std::string agentLabel(const SubAgent& a);
+
+// One Workflow tool run, folded from the three files it writes.
 struct WorkflowRun {
     std::string runId;    // wf_a3f3cbaa-9df
     std::string name;     // the script's own meta.name
     std::string phase;    // the phase its most recent agent was spawned into
     std::string status;   // "running" until the summary lands, then its own
 
-    int          spawned     = 0;
-    int          running     = 0;   // 0 when no hooks are installed
+    // Agents the run has started, and how many of those have stopped. Progress
+    // is counted the way Claude Code counts it, done out of started: neither
+    // this nor Claude Code knows how many a script will spawn before it has.
+    int spawned = 0;
+    int done    = 0;
+    int failed  = 0;   // of `done`, the ones that failed rather than returned
+
     std::int64_t startedAtMs = 0;
 
     bool finished() const { return status != "running"; }
@@ -178,6 +203,12 @@ struct SessionFiles {
 // summary carries the whole script it ran, which is tens of kilobytes, and it
 // cannot change again once it has a terminal status.
 //
+// A run's journal is the one file here that is read again while it is being
+// written, so it is cached against its size instead: it grows by a line when an
+// agent starts and by the agent's entire result when one returns, which is most
+// of the 800KB the largest here reached. Re-parsing that on every refresh, for
+// a run that has not moved, is the cost this avoids.
+//
 // Single-threaded. BoardController owns one and only its worker touches it.
 class SessionFileReader {
 public:
@@ -186,11 +217,19 @@ public:
     SessionFiles read(const std::string& sessionId, const fs::path& cwd);
 
 private:
-    const fs::path& directoryFor(const std::string& sessionId, const fs::path& cwd);
+    // What one run's journal said, and the size it was when it said it.
+    struct Journal {
+        std::uintmax_t        bytes = 0;
+        std::vector<SubAgent> agents;   // in the order the run started them
+    };
+
+    const fs::path&              directoryFor(const std::string& sessionId, const fs::path& cwd);
+    const std::vector<SubAgent>& journalFor(const fs::path& runDir, const std::string& runId);
 
     std::unordered_map<std::string, fs::path>    dirs_;
     std::unordered_map<std::string, SubAgent>    metas_;      // by agent id
     std::unordered_map<std::string, WorkflowRun> finished_;   // by run id
+    std::unordered_map<std::string, Journal>     journals_;   // by run id
 };
 
 // ~/.claude/projects. Empty when the profile cannot be resolved.

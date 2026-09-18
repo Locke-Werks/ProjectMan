@@ -6,6 +6,7 @@
 #include "dock.h"
 #include "enrich.h"
 #include "launcher.h"
+#include "node_explorer_panel.h"
 #include "project_model.h"
 #include "scanner.h"
 #include "strutil.h"
@@ -688,7 +689,7 @@ MainWindow::MainWindow(Config cfg, QWidget* parent)
 
     root->addWidget(new TopRule);
 
-    // The head row is the tab bar. Both tabs sit where the section eyebrow used
+    // The head row is the tab bar. The tabs sit where the section eyebrow used
     // to, because that is exactly what they replaced: a line naming which
     // screen this is now says which screens there are.
     auto* head = new QHBoxLayout;
@@ -696,10 +697,14 @@ MainWindow::MainWindow(Config cfg, QWidget* parent)
 
     projectsTab_ = new TabLabel(QStringLiteral("// Projects"));
     agentsTab_   = new TabLabel(QStringLiteral("// Agents"));
+    nodesTab_    = new TabLabel(QStringLiteral("// Node Explorer"));
     agentsTab_->setToolTip(QStringLiteral("Every Claude Code session on this machine"));
+    nodesTab_->setToolTip(QStringLiteral("The same sessions, as a live graph"));
     head->addWidget(projectsTab_);
     head->addSpacing(18);
     head->addWidget(agentsTab_);
+    head->addSpacing(18);
+    head->addWidget(nodesTab_);
 
     head->addStretch(1);
     counts_ = caption(QStringLiteral("scanning"), kFg4, 11);
@@ -820,14 +825,20 @@ MainWindow::MainWindow(Config cfg, QWidget* parent)
     split->setSizes({ 780, 480 });
     projectsBox->addWidget(split, 1);
 
-    // Built now rather than on first use. Its watcher is what puts the count of
-    // waiting sessions on the AGENTS tab, and a board that only starts watching
-    // once someone opens it can never have told them to.
-    board_ = new AgentBoardPanel(model_->projects(), this);
+    // The watcher first, so child deletion joins its thread before either panel
+    // it posts into goes. Started below rather than on first use: it is what
+    // puts the count of waiting sessions on the AGENTS tab, and a watcher that
+    // only starts once someone opens the board can never have told them to.
+    watch_ = new BoardController(this);
+    board_ = new AgentBoardPanel(this);
+    nodes_ = new NodeExplorerPanel(this);
+
+    projectsPage_ = projectsPage;
 
     pages_ = new QStackedWidget;
-    pages_->addWidget(projectsPage);
+    pages_->addWidget(projectsPage_);
     pages_->addWidget(board_);
+    pages_->addWidget(nodes_);
     root->addWidget(pages_, 1);
 
     grain_ = new GrainOverlay(central);
@@ -859,13 +870,21 @@ MainWindow::MainWindow(Config cfg, QWidget* parent)
 
     connect(projectsTab_, &TabLabel::clicked, this, [this] { showTab(Tab::Projects); });
     connect(agentsTab_, &TabLabel::clicked, this, [this] { showTab(Tab::Agents); });
+    connect(nodesTab_, &TabLabel::clicked, this, [this] { showTab(Tab::Nodes); });
 
+    // One emit, every view. They have to stay one emit: a queued connection
+    // added here later would let two tabs show two different instants of the
+    // same machine.
+    connect(watch_, &BoardController::boardReady, board_, &AgentBoardPanel::setBoard);
+    connect(watch_, &BoardController::boardReady, nodes_, &NodeExplorerPanel::setBoard);
+
+    // The badge stays on one tab. It counts sessions asking for you, and a
+    // second red tab for the same fact would be two alarms for one thing.
     connect(board_, &AgentBoardPanel::attentionChanged, agentsTab_, &TabLabel::setBadge);
-    connect(board_, &AgentBoardPanel::countsChanged, this, [this](const QString& text) {
-        agentCounts_ = text;
-        if (tab_ == Tab::Agents)
-            counts_->setText(text);
-    });
+    connect(board_, &AgentBoardPanel::countsChanged, this,
+            [this](const QString& text) { setCounts(Tab::Agents, text); });
+    connect(nodes_, &NodeExplorerPanel::countsChanged, this,
+            [this](const QString& text) { setCounts(Tab::Nodes, text); });
 
     // The board decides nothing about how a session starts. It names a
     // directory and this answers with the same launch the project list would
@@ -903,17 +922,24 @@ MainWindow::MainWindow(Config cfg, QWidget* parent)
                   [this] { launch(LaunchMode::Resume); });
     new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_T), this,
                   [this] { openTerminal(); });
-    // Ctrl+B goes to the board and back rather than only to it. It used to open
-    // a window, where pressing it again on the window already in front had
-    // nothing left to do.
-    new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_B), this,
-                  [this] { showTab(tab_ == Tab::Agents ? Tab::Projects : Tab::Agents); });
+    // Ctrl+B moves on rather than only going to the board. It used to open a
+    // window, where pressing it again on the window already in front had
+    // nothing left to do; with three tabs it cycles, so the key never lands on
+    // the screen it started from.
+    new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_B), this, [this] {
+        showTab(static_cast<Tab>((static_cast<int>(tab_) + 1) % kTabCount));
+    });
     new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_Comma), this,
                   [this] { openSettings(); });
 
     refreshDockNote();
     onSelectionChanged();
     showTab(Tab::Projects);
+
+    // Last, so both panels are connected before the first board can land.
+    watch_->setProjects(model_->projects());
+    watch_->start();
+
     scan_->start(cfg_);
 }
 
@@ -952,8 +978,8 @@ void MainWindow::closeEvent(QCloseEvent* e)
     // what joins the watcher thread. A thread still waiting on
     // ReadDirectoryChangesW after the event loop has gone is an app that never
     // finishes exiting.
-    if (board_)
-        board_->shutdown();
+    if (watch_)
+        watch_->shutdown();
 
     e->accept();
 }
@@ -966,12 +992,10 @@ void MainWindow::onRowReady(int row, pm::Project project)
 
 void MainWindow::onSweepFinished(int probed, int failed, double seconds)
 {
-    projectCounts_ = QStringLiteral("%1 probed  %2 failed  %3 s")
-                         .arg(probed)
-                         .arg(failed)
-                         .arg(seconds, 0, 'f', 2);
-    if (tab_ == Tab::Projects)
-        counts_->setText(projectCounts_);
+    setCounts(Tab::Projects, QStringLiteral("%1 probed  %2 failed  %3 s")
+                                 .arg(probed)
+                                 .arg(failed)
+                                 .arg(seconds, 0, 'f', 2));
 
     updateCounts();
     feedBoard();
@@ -985,12 +1009,10 @@ void MainWindow::updateCounts()
             ++dirty;
         open += p.open.total();
     }
-    projectCounts_ = QStringLiteral("%1 projects   %2 dirty   %3 open")
-                         .arg(model_->rowCount())
-                         .arg(dirty)
-                         .arg(open);
-    if (tab_ == Tab::Projects)
-        counts_->setText(projectCounts_);
+    setCounts(Tab::Projects, QStringLiteral("%1 projects   %2 dirty   %3 open")
+                                 .arg(model_->rowCount())
+                                 .arg(dirty)
+                                 .arg(open));
 }
 
 const Project* MainWindow::current() const
@@ -1216,24 +1238,43 @@ void MainWindow::showTab(Tab tab)
 {
     tab_ = tab;
 
-    const bool agents = tab == Tab::Agents;
-    pages_->setCurrentIndex(agents ? 1 : 0);
-    projectsTab_->setActive(!agents);
-    agentsTab_->setActive(agents);
-    counts_->setText(agents ? agentCounts_ : projectCounts_);
+    // Both initialised before the switch: /WX turns "potentially uninitialised"
+    // into a failed CI build on a switch the compiler will not call exhaustive.
+    QWidget* page  = projectsPage_;
+    QWidget* focus = filter_;
 
+    switch (tab) {
     // The filter box only exists on the project page, so the focus it was
     // holding has to go somewhere that still takes keys.
-    if (agents)
-        board_->setFocus();
-    else
-        filter_->setFocus();
+    case Tab::Projects: page = projectsPage_; focus = filter_; break;
+    case Tab::Agents:   page = board_;        focus = board_;  break;
+    case Tab::Nodes:    page = nodes_;        focus = nodes_;  break;
+    }
+
+    // By widget rather than by index. The index was a second account of the
+    // page order kept in step with the addWidget calls by nothing but
+    // attention, and getting it wrong shows the wrong page rather than failing.
+    pages_->setCurrentWidget(page);
+    focus->setFocus();
+
+    projectsTab_->setActive(tab == Tab::Projects);
+    agentsTab_->setActive(tab == Tab::Agents);
+    nodesTab_->setActive(tab == Tab::Nodes);
+
+    counts_->setText(tabCounts_[static_cast<int>(tab)]);
+}
+
+void MainWindow::setCounts(Tab which, const QString& text)
+{
+    tabCounts_[static_cast<int>(which)] = text;
+    if (tab_ == which)
+        counts_->setText(text);
 }
 
 void MainWindow::feedBoard()
 {
-    if (board_)
-        board_->setProjects(model_->projects());
+    if (watch_)
+        watch_->setProjects(model_->projects());
 }
 
 void MainWindow::onDetailReady(quint64 token, pm::git::RepoDetail d)
