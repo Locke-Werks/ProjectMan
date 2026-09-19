@@ -5,7 +5,7 @@
 
 [product]
 name         = "ProjectMan"
-version      = "1.0.0"
+version      = "1.0.1"
 publisher    = "Locke Werks"
 description  = "A control surface over your projects tree"
 copyright    = "Copyright (C) 2026 Locke Werks"
