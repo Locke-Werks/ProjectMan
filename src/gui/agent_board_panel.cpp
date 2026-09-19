@@ -4,6 +4,7 @@
 #include "theme_qt.h"
 #include "widgets.h"
 
+#include <QDateTime>
 #include <QEvent>
 #include <QFontMetrics>
 #include <QFrame>
@@ -355,14 +356,36 @@ void BoardController::buildAndPost()
     // Live sessions only. A session directory outlives its session by design,
     // so reading every one of them would be reading the whole history of the
     // machine to describe work that finished weeks ago.
+    // Background jobs are read first because they name sessions the registry
+    // does not, and those sessions have subagents, shells and task lists of
+    // their own that would otherwise go unread.
+    const std::vector<BackgroundJob> jobs = readJobs();
+
     std::vector<SessionFiles> files;
-    files.reserve(registry.size());
+    files.reserve(registry.size() + jobs.size());
+
+    // One clock for the whole rebuild: a monitor is judged against its own
+    // deadline, and two sessions read a moment apart would be a board that
+    // disagrees with itself about what time it is.
+    const std::int64_t now = QDateTime::currentMSecsSinceEpoch();
+
+    const auto readSession = [&](const std::string& sessionId, const fs::path& cwd) {
+        SessionFiles f = sessions_.read(sessionId, cwd);
+        f.tasks        = tasks_.read(sessionId, cwd, now);
+        f.todos        = readTodos(sessionId);
+        files.push_back(std::move(f));
+    };
+
     for (const RegistryEntry& e : registry) {
         if (!e.sessionId.empty())
-            files.push_back(sessions_.read(e.sessionId, e.cwd));
+            readSession(e.sessionId, e.cwd);
+    }
+    for (const BackgroundJob& job : jobs) {
+        if (job.live && !job.sessionId.empty())
+            readSession(job.sessionId, job.cwd);
     }
 
-    AgentList board = buildBoard(registry, events, files, projects);
+    AgentList board = buildBoard(registry, events, files, jobs, readPlans(kPlanWindowMs), projects);
 
     // Emitted from inside the posted lambda, so the signal runs on the GUI
     // thread as a direct call and the list never crosses as a queued argument.
@@ -688,7 +711,10 @@ void AgentBoardPanel::refreshActions()
 {
     const AgentCard* c = selected();
 
-    focus_->setEnabled(c != nullptr && c->live && c->pid != 0);
+    // A background job has a pid and no window: it runs under the daemon, not
+    // in anybody's terminal, so there is nothing for FOCUS to raise.
+    focus_->setEnabled(c != nullptr && c->live && c->pid != 0
+                       && c->kind == CardKind::Interactive);
 
     const bool haveCwd = c != nullptr && !c->cwd.empty();
     engage_->setEnabled(haveCwd);

@@ -36,7 +36,7 @@ namespace pm::cli {
 //   event    the hook_event_name, verbatim
 //   session  session_id
 //   cwd      the session's working directory
-//   tool     tool_name, on PreToolUse only; absent otherwise
+//   tool     tool_name, on PreToolUse and PostToolUse; absent otherwise
 //   detail   what the card should show, by event:
 //              SessionStart       source ("startup", "resume", "compact")
 //              UserPromptSubmit   the prompt, first line, cut to fit
@@ -49,12 +49,27 @@ namespace pm::cli {
 //
 //   agent      agent_id, present on anything a SUBAGENT did
 //   agentType  agent_type: "Explore", "workflow-subagent", a named agent
-//   toolUse    tool_use_id, PreToolUse only
+//   toolUse    tool_use_id, PreToolUse and PostToolUse
+//   task       backgroundTaskId or taskId, PostToolUse only
 //
-// Those last three are why the board can tell a session's own work from its
-// subagents'. A subagent runs under its parent's session_id and reports its
-// tool calls through the same hooks, so without agent_id a card shows whichever
-// of five subagents called a tool last as what the session itself is doing.
+// PostToolUse is a special case and does not mirror PreToolUse. A line is
+// written ONLY when the tool response carries a background task id, which is
+// the name of the file under %TEMP%\claude that the call writes its output
+// into. Every other PostToolUse is dropped before anything is opened, so the
+// log grows by a line per background task rather than a line per tool call.
+// Such a line carries no detail of its own: `toolUse` points at the PreToolUse
+// line that already holds the command.
+//
+// That id has two spellings and they are not interchangeable. Bash calls it
+// backgroundTaskId and Monitor calls it taskId. Both are read, because they
+// mean the same thing and a reader that knows only the first sees every shell
+// and never a monitor.
+//
+// agent, agentType and toolUse are why the board can tell a session's own work
+// from its subagents'. A subagent runs under its parent's session_id and
+// reports its tool calls through the same hooks, so without agent_id a card
+// shows whichever of five subagents called a tool last as what the session
+// itself is doing.
 // Verified on CLI 2.1.276, where the parent's own spawn call is tool_name
 // "Agent" and carries no agent_id.
 //

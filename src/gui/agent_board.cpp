@@ -1,5 +1,6 @@
 #include "agent_board.h"
 
+#include "claude_files.h"
 #include "json.h"
 #include "strutil.h"
 
@@ -18,23 +19,20 @@
 namespace pm::gui {
 namespace {
 
-fs::path knownFolder(REFKNOWNFOLDERID id)
-{
-    PWSTR raw = nullptr;
-    if (FAILED(SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, nullptr, &raw))) {
-        if (raw)
-            CoTaskMemFree(raw);
-        return {};
-    }
-    fs::path out(raw);
-    CoTaskMemFree(raw);
-    return out;
-}
+// Reading a file somebody else is still writing, and the field accessors
+// that go with it. claude_files.h holds them because claude_state.cpp reads
+// the same kind of file the same way; the reasoning for each is there.
+using cf::anyString;
+using cf::fileWriteTimeMs;
+using cf::intField;
+using cf::kFileTimeUnixEpoch;
+using cf::processStillOurs;
+using cf::projectSlug;
+using cf::readShared;
+using cf::stringField;
+using cf::ticksField;
 
 // ----------------------------------------------------------------- reading
-
-// FILETIME counts 100ns ticks from 1601; Unix time counts from 1970.
-constexpr std::int64_t kFileTimeUnixEpoch = 116444736000000000LL;
 
 // The log rolls at 4MB and the board reads the live file plus one back-file,
 // so this bound is never reached in normal running. It exists for the case
@@ -69,161 +67,9 @@ constexpr std::size_t kMaxCachedAgents = 20000;
 // stopped being about anything still on screen.
 constexpr std::size_t kMaxCachedRuns = 512;
 
-// The tail of a file, read without taking it away from whoever is writing it.
-//
-// Sessions append to the event log continuously and Claude Code rewrites a
-// registry record on every status change. An exclusive open would fail against
-// a live writer, or worse, block a hook that sits on the critical path of
-// someone's tool call. FILE_SHARE_DELETE is in the set for the rollover, which
-// renames the live log out from under any reader holding it open.
-std::string readShared(const fs::path& file, std::int64_t maxBytes)
-{
-    HANDLE h = CreateFileW(file.c_str(), GENERIC_READ,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE)
-        return {};
 
-    LARGE_INTEGER size{};
-    if (!GetFileSizeEx(h, &size) || size.QuadPart <= 0) {
-        CloseHandle(h);
-        return {};
-    }
 
-    const std::int64_t from = size.QuadPart > maxBytes ? size.QuadPart - maxBytes : 0;
-    LARGE_INTEGER      seek{};
-    seek.QuadPart = from;
-    if (from > 0 && !SetFilePointerEx(h, seek, nullptr, FILE_BEGIN)) {
-        CloseHandle(h);
-        return {};
-    }
 
-    const std::size_t want = static_cast<std::size_t>(size.QuadPart - from);
-    std::string       text(want, '\0');
-
-    std::size_t have = 0;
-    while (have < want) {
-        const DWORD chunk = static_cast<DWORD>(std::min<std::size_t>(want - have, 1u << 20));
-        DWORD       got   = 0;
-        if (!ReadFile(h, text.data() + have, chunk, &got, nullptr) || got == 0)
-            break;
-        have += got;
-    }
-    CloseHandle(h);
-    text.resize(have);
-
-    // Starting partway in lands mid-record. That first fragment is not a line.
-    if (from > 0) {
-        const std::size_t nl = text.find('\n');
-        text = (nl == std::string::npos) ? std::string() : text.substr(nl + 1);
-    }
-    return text;
-}
-
-// ------------------------------------------------------------------- fields
-
-std::string stringField(const json::Value* object, const char* key)
-{
-    if (!object)
-        return {};
-    const json::Value* v = object->find(key);
-    return (v && v->type == json::Value::Type::String) ? v->string : std::string();
-}
-
-// For a key whose shape is not pinned down. The registry is undocumented and
-// carries the CLI version that wrote it, so status and waitingFor are strings
-// on 2.1.270 and need not be on the next one. A number or an object comes back
-// as its JSON rather than as nothing, which puts an unrecognised value on the
-// card instead of letting it read as absent. Keys read as structure rather
-// than as text, sessionId and cwd, still go through stringField.
-std::string anyString(const json::Value* object, const char* key)
-{
-    if (!object)
-        return {};
-    const json::Value* v = object->find(key);
-    if (!v || v->isNull())
-        return {};
-    if (v->type == json::Value::Type::String)
-        return v->string;
-    return json::dump(*v);
-}
-
-std::int64_t intField(const json::Value* object, const char* key)
-{
-    if (!object)
-        return 0;
-    const json::Value* v = object->find(key);
-    if (!v || v->type != json::Value::Type::Number)
-        return 0;
-    return v->isInteger ? v->integer : static_cast<std::int64_t>(v->number);
-}
-
-// procStart, a process creation FILETIME written as a decimal string because
-// the value is past what a double holds exactly. Read it either way: a later
-// writer emitting it as a number would still be reporting the same thing.
-unsigned long long ticksField(const json::Value* object, const char* key)
-{
-    if (!object)
-        return 0;
-    const json::Value* v = object->find(key);
-    if (!v)
-        return 0;
-
-    if (v->type == json::Value::Type::String) {
-        char*                    end = nullptr;
-        const unsigned long long n   = std::strtoull(v->string.c_str(), &end, 10);
-        return (end && *end == '\0') ? n : 0;
-    }
-    if (v->type == json::Value::Type::Number && v->isInteger && v->integer > 0)
-        return static_cast<unsigned long long>(v->integer);
-    return 0;
-}
-
-// --------------------------------------------------------- session files
-
-// The write time of a file, as Unix milliseconds. Zero when it cannot be read.
-//
-// A meta file is written once, when its subagent spawns, so its own timestamp
-// is when that subagent started. Nothing inside it says so.
-std::int64_t fileWriteTimeMs(const fs::path& file)
-{
-    WIN32_FILE_ATTRIBUTE_DATA data{};
-    if (!GetFileAttributesExW(file.c_str(), GetFileExInfoStandard, &data))
-        return 0;
-
-    ULARGE_INTEGER t{};
-    t.LowPart  = data.ftLastWriteTime.dwLowDateTime;
-    t.HighPart = data.ftLastWriteTime.dwHighDateTime;
-    if (t.QuadPart < static_cast<unsigned long long>(kFileTimeUnixEpoch))
-        return 0;
-    return (static_cast<std::int64_t>(t.QuadPart) - kFileTimeUnixEpoch) / 10000;
-}
-
-// A cwd as Claude Code spells the directory it keeps that session's files in:
-// every character that is not a letter or a digit becomes a dash, and runs are
-// not collapsed, so "C:\p\My App" is "C--p-My-App".
-//
-// Checked against all 28 project directories on this machine by reading each
-// transcript's own cwd back and recomputing the name: 28 matches, 0 misses.
-// It is not invertible, since a project whose name contains a dash spells the
-// same as one containing a space, so this only ever goes cwd to slug.
-//
-// If a later Claude Code changes the rule, the cost is the subagent lines on a
-// card. Everything the board already showed is read from somewhere else.
-std::string projectSlug(const fs::path& cwd)
-{
-    std::string s = narrow(cwd.wstring());
-    while (s.size() > 1 && (s.back() == '\\' || s.back() == '/'))
-        s.pop_back();
-
-    for (char& c : s) {
-        const bool alnum = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
-                        || (c >= '0' && c <= '9');
-        if (!alnum)
-            c = '-';
-    }
-    return s;
-}
 
 // "agent-a06be1cc93c314534.meta.json" holds exactly the agent_id a hook
 // reports, so the file source and the hook source join on it with no mapping.
@@ -369,52 +215,6 @@ std::vector<SubAgent> readJournal(const fs::path& file, const std::string& runId
     return out;
 }
 
-// -------------------------------------------------------------- still alive
-
-// Whether the pid in a registry record still belongs to the session that wrote
-// it. Two separate questions, and the second is the one that bites: the
-// registry keeps files for processes that have exited, and Windows hands a pid
-// straight back out, so a stale file can name a pid that something unrelated
-// now owns. The record carries the creation time that pid had when it was
-// written, which is what tells the two apart.
-bool processStillOurs(unsigned long pid, unsigned long long recordedTicks,
-                      std::int64_t startedAtMs)
-{
-    if (pid == 0)
-        return false;
-
-    HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!proc)
-        return false;
-
-    FILETIME created{}, exited{}, kernel{}, user{};
-    const bool got = GetProcessTimes(proc, &created, &exited, &kernel, &user) != 0;
-    CloseHandle(proc);
-
-    // The handle opened, so something is running under that pid. Without a
-    // creation time there is nothing left to check it against.
-    if (!got)
-        return true;
-
-    ULARGE_INTEGER createdTicks{};
-    createdTicks.LowPart  = created.dwLowDateTime;
-    createdTicks.HighPart = created.dwHighDateTime;
-
-    if (recordedTicks != 0)
-        return createdTicks.QuadPart == recordedTicks;
-
-    // No procStart, so fall back on when the record says the session started.
-    // A pid reissued after that session exited belongs to a process created
-    // later than the record was written. The slack covers the second or so
-    // between the process starting and Claude Code writing the file.
-    if (startedAtMs > 0) {
-        constexpr std::int64_t kSlackMs = 60 * 1000;
-        const std::int64_t     createdMs =
-            (static_cast<std::int64_t>(createdTicks.QuadPart) - kFileTimeUnixEpoch) / 10000;
-        return createdMs <= startedAtMs + kSlackMs;
-    }
-    return true;
-}
 
 // --------------------------------------------------------------- path names
 
@@ -654,6 +454,143 @@ void applyFiles(Building& b, const SessionFiles& f)
     }
 
     b.card.workflows = f.workflows;
+    b.card.tasks     = f.tasks;
+    b.card.todos     = f.todos;
+}
+
+// A background Claude session onto a card.
+//
+// Lands where a registry entry would, and for the same reason: this is the only
+// source that knows the process exists. `busy` rather than a column directly,
+// so a job goes through the same chain every other card does and a hook event
+// from inside one can still move it to NeedsYou.
+void applyJob(Building& b, const BackgroundJob& job)
+{
+    AgentCard& c = b.card;
+
+    c.kind      = CardKind::Background;
+    c.sessionId = job.sessionId;
+    c.live      = true;
+    c.pid       = job.pid;
+
+    if (!job.name.empty())
+        c.name = job.name;
+    if (!job.cwd.empty())
+        c.cwd = job.cwd;
+
+    // The job's own rolling line, which its timeline keeps more current than
+    // any hook does: a daemon worker writes a state change per turn whether or
+    // not ProjectMan's hooks are installed on the machine.
+    if (!job.detail.empty())
+        c.activity = job.detail;
+    if (c.prompt.empty() && !job.intent.empty())
+        c.prompt = job.intent;
+
+    if (job.createdAtMs > 0)
+        c.startedAtMs = job.createdAtMs;
+    c.lastActivityMs = std::max(c.lastActivityMs, job.updatedAtMs);
+
+    b.busy = b.busy || job.working();
+}
+
+// ------------------------------------------------------- the background tasks
+
+// What opened a background task: the tool, the text it was given, and when it
+// stops mattering.
+struct TaskCall {
+    TaskKind    kind = TaskKind::Unknown;
+    std::string label;
+
+    // Monitors only. The PostToolUse timestamp plus the watch's declared
+    // timeout, which is when it can no longer be armed. Zero for a shell, which
+    // answers the same question with its own open file handle instead.
+    std::int64_t expiresAtMs = 0;
+};
+
+TaskKind kindForTool(const std::string& tool)
+{
+    if (tool == "Monitor")
+        return TaskKind::Monitor;
+    if (tool == "Bash" || tool == "PowerShell")
+        return TaskKind::Shell;
+    // Something else learned to open one. Unknown is a real answer and the node
+    // still draws, labelled with whatever the call carried.
+    return TaskKind::Unknown;
+}
+
+// Every background task the log can name, keyed by session and task id.
+//
+// Two passes over the events because the halves arrive in either order and
+// neither is much use alone: PostToolUse carries the task id and nothing else,
+// PreToolUse carries the command and cannot know the id yet. They are tied by
+// tool_use_id, which is exact. Keyed by session as well because a task id is
+// Claude Code's and nothing promises it is unique across sessions.
+std::unordered_map<std::string, TaskCall> taskCalls(const std::vector<AgentEvent>& events)
+{
+    std::unordered_map<std::string, const AgentEvent*> calls;
+    for (const AgentEvent& ev : events) {
+        if (ev.event == "PreToolUse" && !ev.toolUseId.empty())
+            calls[ev.toolUseId] = &ev;
+    }
+
+    std::unordered_map<std::string, TaskCall> out;
+    for (const AgentEvent& ev : events) {
+        if (ev.event != "PostToolUse" || ev.task.empty() || ev.sessionId.empty())
+            continue;
+
+        TaskCall call;
+        // The PostToolUse line carries the tool name too, so a PreToolUse that
+        // has rolled off the back of the log still leaves the kind known and
+        // only costs the label.
+        call.kind = kindForTool(ev.tool);
+
+        if (const auto at = calls.find(ev.toolUseId); at != calls.end()) {
+            call.label = at->second->detail;
+            if (call.kind == TaskKind::Unknown)
+                call.kind = kindForTool(at->second->tool);
+
+            // The deadline is counted from here rather than from the PreToolUse
+            // that carries it: the watch starts when the call returns, and this
+            // line IS the call returning.
+            if (call.kind == TaskKind::Monitor && at->second->ttlMs > 0)
+                call.expiresAtMs = ev.tsMs + at->second->ttlMs;
+        }
+        out[ev.sessionId + "/" + ev.task] = std::move(call);
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------- the plans
+
+// Which session wrote a plan.
+//
+// A plan file carries no session id, so the join is its write time against the
+// ExitPlanMode events in the log: that tool is what writes the file, and the
+// two happen within the same moment. The window is generous because the file's
+// timestamp and the hook's clock are taken independently, and tight enough that
+// two sessions leaving plan mode minutes apart cannot be confused.
+//
+// A plan matching nothing gets no session and is dropped by the caller. That is
+// the common case for a directory that keeps every plan ever made.
+constexpr std::int64_t kPlanJoinMs = 30 * 1000;
+
+std::string sessionForPlan(const PlanDoc& plan, const std::vector<AgentEvent>& events)
+{
+    std::string  best;
+    std::int64_t bestGap = kPlanJoinMs + 1;
+
+    for (const AgentEvent& ev : events) {
+        if (ev.event != "PreToolUse" || ev.tool != "ExitPlanMode" || ev.sessionId.empty())
+            continue;
+
+        const std::int64_t gap =
+            ev.tsMs > plan.writtenAtMs ? ev.tsMs - plan.writtenAtMs : plan.writtenAtMs - ev.tsMs;
+        if (gap <= kPlanJoinMs && gap < bestGap) {
+            bestGap = gap;
+            best    = ev.sessionId;
+        }
+    }
+    return best;
 }
 
 // Where the two sources meet.
@@ -877,6 +814,8 @@ std::vector<AgentEvent> readEvents(const fs::path& eventLog, std::int64_t sinceM
             e.agentId   = stringField(&doc, "agent");
             e.agentType = stringField(&doc, "agentType");
             e.toolUseId = stringField(&doc, "toolUse");
+            e.task      = stringField(&doc, "task");
+            e.ttlMs     = intField(&doc, "ttl");
 
             const std::string cwd = stringField(&doc, "cwd");
             if (!cwd.empty())
@@ -1082,10 +1021,12 @@ SessionFiles SessionFileReader::read(const std::string& sessionId, const fs::pat
 
 // -------------------------------------------------------------------- board
 
-AgentList buildBoard(const std::vector<RegistryEntry>& registry,
-                     const std::vector<AgentEvent>&    events,
-                     const std::vector<SessionFiles>&  files,
-                     const ProjectList&                projects)
+AgentList buildBoard(const std::vector<RegistryEntry>&  registry,
+                     const std::vector<AgentEvent>&     events,
+                     const std::vector<SessionFiles>&   files,
+                     const std::vector<BackgroundJob>&  jobs,
+                     const std::vector<PlanDoc>&        plans,
+                     const ProjectList&                 projects)
 {
     std::vector<Building>                        build;
     std::unordered_map<std::string, std::size_t> byKey;
@@ -1114,6 +1055,25 @@ AgentList buildBoard(const std::vector<RegistryEntry>& registry,
         applyRegistry(build[it->second], e);
     }
 
+    // Then the background jobs, which are the other half of "a process exists".
+    // A finished one is dropped here rather than shown in Done: its directory
+    // is kept for ever, so admitting them would fill the board with every
+    // headless session this machine has ever run.
+    for (const BackgroundJob& job : jobs) {
+        if (!job.live)
+            continue;
+
+        const std::string key =
+            job.sessionId.empty() ? ("job:" + job.shortId) : job.sessionId;
+
+        const auto [it, inserted] = byKey.try_emplace(key, build.size());
+        if (inserted) {
+            build.emplace_back();
+            build.back().card.sessionId = job.sessionId;
+        }
+        applyJob(build[it->second], job);
+    }
+
     // Then the events. A session id with no registry entry has no process left
     // behind it, so it arrives here already destined for Done.
     for (const AgentEvent& ev : events) {
@@ -1138,6 +1098,42 @@ AgentList buildBoard(const std::vector<RegistryEntry>& registry,
             continue;
         if (const auto it = byKey.find(f.sessionId); it != byKey.end())
             applyFiles(build[it->second], f);
+    }
+
+    // Name the tasks the files found. The files know a task exists and what it
+    // is saying; only the log knows what opened it, and only when hooks are
+    // installed. An unnamed task still draws.
+    if (const auto calls = taskCalls(events); !calls.empty()) {
+        for (Building& b : build) {
+            for (BackgroundTask& t : b.card.tasks) {
+                const auto at = calls.find(b.card.sessionId + "/" + t.id);
+                if (at == calls.end())
+                    continue;
+                t.kind        = at->second.kind;
+                t.label       = at->second.label;
+                t.expiresAtMs = at->second.expiresAtMs;
+            }
+        }
+    }
+
+    // And hang each plan off whichever session wrote it. Newest first already,
+    // so the first match is the one a card keeps.
+    for (const PlanDoc& plan : plans) {
+        const std::string owner = sessionForPlan(plan, events);
+        if (owner.empty())
+            continue;
+
+        const auto it = byKey.find(owner);
+        if (it == byKey.end())
+            continue;
+
+        AgentCard& c = build[it->second].card;
+        if (!c.plans.empty())
+            continue;   // a session's current plan, not its history
+
+        PlanDoc joined = plan;
+        joined.sessionId = owner;
+        c.plans.push_back(std::move(joined));
     }
 
     const std::vector<ProjectKey> keys = projectKeys(projects);
@@ -1210,7 +1206,7 @@ AgentList buildBoard(const std::vector<RegistryEntry>& registry,
 
 fs::path eventLogPath()
 {
-    const fs::path local = knownFolder(FOLDERID_LocalAppData);
+    const fs::path local = cf::localAppData();
     if (local.empty())
         return {};
     return local / "ProjectMan" / "agents" / "events.jsonl";
@@ -1218,7 +1214,7 @@ fs::path eventLogPath()
 
 fs::path sessionRegistryDir()
 {
-    const fs::path profile = knownFolder(FOLDERID_Profile);
+    const fs::path profile = cf::userProfile();
     if (profile.empty())
         return {};
     return profile / ".claude" / "sessions";
@@ -1226,7 +1222,7 @@ fs::path sessionRegistryDir()
 
 fs::path sessionDataRoot()
 {
-    const fs::path profile = knownFolder(FOLDERID_Profile);
+    const fs::path profile = cf::userProfile();
     if (profile.empty())
         return {};
     return profile / ".claude" / "projects";

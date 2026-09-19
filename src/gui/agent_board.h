@@ -1,5 +1,6 @@
 #pragma once
 
+#include "claude_state.h"
 #include "model.h"
 
 #include <cstdint>
@@ -106,10 +107,24 @@ struct AgentEvent {
     std::string agentId;
     std::string agentType;
 
-    // PreToolUse only. On the parent's own Agent call this is what the spawned
-    // subagent's meta file carries as toolUseId, which is what ties a running
-    // subagent back to the description it was given.
+    // PreToolUse and PostToolUse. On the parent's own Agent call this is what
+    // the spawned subagent's meta file carries as toolUseId, which is what ties
+    // a running subagent back to the description it was given. On a PostToolUse
+    // it is the other half of the background task join below.
     std::string toolUseId;
+
+    // PostToolUse only, and the only reason that event is registered at all:
+    // the id of the background shell or monitor the call opened, which is also
+    // the name of the file it writes its output into. The line carries nothing
+    // else, so `toolUseId` is followed back to the PreToolUse that holds the
+    // command. See src/cli/hook.h.
+    std::string task;
+
+    // PreToolUse on a Monitor only: how long that watch stays armed, in
+    // milliseconds, off its own tool_input. The one thing on the machine that
+    // says when a monitor stops, since it holds nothing open and rewrites
+    // nothing when it ends. Zero everywhere else.
+    std::int64_t ttlMs = 0;
 };
 
 // What is known about one subagent.
@@ -181,11 +196,21 @@ std::vector<RegistryEntry> readRegistry(const fs::path& sessionsDir);
 // the board every event behind it.
 std::vector<AgentEvent> readEvents(const fs::path& eventLog, std::int64_t sinceMs = 0);
 
-// One session's own directory, read for what happened inside it.
+// Everything read per session: its own directory, plus the two state
+// directories keyed by session id that live elsewhere.
+//
+// One struct rather than three parallel vectors, because the only thing tying
+// them together is the session id and three lists that have to stay in the same
+// order is a bug waiting for the first session that has tasks but no subagents.
 struct SessionFiles {
     std::string               sessionId;
     std::vector<SubAgent>     agents;
     std::vector<WorkflowRun>  workflows;
+
+    // %TEMP%\claude\<slug>\<session>\tasks and ~/.claude/tasks/<session>.
+    // Neither is under the session's own directory; see claude_state.h.
+    std::vector<BackgroundTask> tasks;
+    std::vector<TodoItem>       todos;
 };
 
 // Reads those directories, and remembers what it has already read.
@@ -237,12 +262,24 @@ fs::path sessionDataRoot();
 
 // ------------------------------------------------------------------ the board
 
+// What kind of session a card stands for.
+//
+// A background job is a real Claude Code session with a real pid, and nearly
+// every field below means the same thing for one. The exception is the window:
+// a daemon worker has none, so FOCUS has nothing to raise and the board gates
+// it on this rather than on the pid being non-zero.
+enum class CardKind {
+    Interactive,   // a session registry entry: someone's terminal
+    Background,    // ~/.claude/jobs: running headless under the daemon
+};
+
 struct AgentCard {
     std::string sessionId;
     std::string name;        // from the registry; falls back to the cwd leaf
     fs::path    cwd;
     std::string project;     // ProjectMan's display name for cwd, when it knows one
     AgentColumn column = AgentColumn::Done;
+    CardKind    kind   = CardKind::Interactive;
 
     std::string activity;    // "Edit src/gui/agent_board.cpp", from PreToolUse
     std::string prompt;      // the last thing asked of it, from UserPromptSubmit
@@ -259,6 +296,14 @@ struct AgentCard {
     // Running first, then most recently active. Workflow runs newest first.
     std::vector<SubAgent>    agents;
     std::vector<WorkflowRun> workflows;
+
+    // What the session has in flight that is not an agent: its shells and
+    // monitors, its task list, and the plan it wrote if it wrote one while the
+    // event log could still see it. Live tasks first; todos in id order; a card
+    // holds at most one plan, the most recent it can be joined to.
+    std::vector<BackgroundTask> tasks;
+    std::vector<TodoItem>       todos;
+    std::vector<PlanDoc>        plans;
 
     unsigned long pid = 0;
     std::int64_t  startedAtMs    = 0;
@@ -282,11 +327,25 @@ using AgentList = std::vector<AgentCard>;
 // `files` is one entry per session whose directory was read, joined by session
 // id. A session missing from it simply has no subagents to show.
 //
+// `jobs` is every background Claude session the daemon knows about. Unlike
+// everything else here these DO make cards of their own: they are the one kind
+// of live session that never writes a registry file, so if this did not conjure
+// a card for them nothing else would, and a headless agent working on a repo
+// would be invisible on a board whose whole job is to show what is running.
+// Finished ones are dropped, the same as a finished workflow run.
+//
+// `plans` is every recent plan document, and none of them carries a session id.
+// Each is joined to the session whose ExitPlanMode event sits closest to when
+// the file was written; one that matches nothing is not shown. A plan older
+// than the event log's window therefore falls away on its own.
+//
 // Ordering within a column is most recently active first.
-AgentList buildBoard(const std::vector<RegistryEntry>& registry,
-                     const std::vector<AgentEvent>&    events,
-                     const std::vector<SessionFiles>&  files,
-                     const ProjectList&                projects);
+AgentList buildBoard(const std::vector<RegistryEntry>&  registry,
+                     const std::vector<AgentEvent>&     events,
+                     const std::vector<SessionFiles>&   files,
+                     const std::vector<BackgroundJob>&  jobs,
+                     const std::vector<PlanDoc>&        plans,
+                     const ProjectList&                 projects);
 
 // ------------------------------------------------------------------ locations
 

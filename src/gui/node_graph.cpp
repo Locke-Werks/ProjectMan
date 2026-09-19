@@ -2,8 +2,11 @@
 
 #include "theme_qt.h"
 
+#include <QDateTime>
+
 #include <algorithm>
 #include <cmath>
+#include <unordered_map>
 #include <utility>
 
 namespace pm::gui {
@@ -20,6 +23,16 @@ constexpr qreal kSessionRadius = 26.0;
 constexpr qreal kRunRadius     = 15.0;
 constexpr qreal kAgentRadius   = 8.0;
 
+// The boxes. Half the side of the square, so a shell is 20 units across
+// against an agent's 16 diameter: near enough to sit in the same crowd, far
+// enough that the shape reads before the size does. A todo is smaller because
+// there are many of them and none is a running thing.
+constexpr qreal kShellRadius   = 10.0;
+constexpr qreal kMonitorRadius = 10.0;
+constexpr qreal kToolRadius    = 7.0;
+constexpr qreal kTodoRadius    = 6.0;
+constexpr qreal kPlanRadius    = 9.0;
+
 // A run that spawned forty agents should read as a bigger thing than one that
 // spawned two, without reading as a second session. log2 because the difference
 // worth seeing is between 2 and 20, not between 100 and 173.
@@ -32,6 +45,11 @@ constexpr qreal kRunRadiusMax = 26.0;
 constexpr qreal kSessionMass = 6.0;
 constexpr qreal kRunMass     = 2.5;
 constexpr qreal kAgentMass   = 1.0;
+
+// A box is lighter than an agent so it gets out of the way rather than shoving
+// a subtree around: what a session has spawned is the structure, and what it is
+// doing hangs off the side of it.
+constexpr qreal kWorkMass = 0.8;
 
 // --------------------------------------------------------------- the repulsion
 
@@ -60,6 +78,16 @@ constexpr qreal kRestSessionRun   = 120.0;
 constexpr qreal kRestSessionAgent = 86.0;
 constexpr qreal kRestRunAgent     = 64.0;
 
+// Boxes sit further out than loose agents and closer in than runs. They carry
+// two lines of text each, so the ring they occupy has to be wide enough for the
+// text not to cross the ring inside it.
+constexpr qreal kRestSessionWork = 104.0;
+
+// One task-list item to the next one it unblocks. Short, because a chain is
+// read as a chain: far enough apart to see the link, close enough that four
+// steps of it stay one object rather than four.
+constexpr qreal kRestTodoChain = 52.0;
+
 // n children of one parent pack into a disc of radius spacing*sqrt(n/pi).
 // Feeding that back in as the rest length is what keeps a forty-agent run in
 // the regime the spring was tuned for: without it the spring is stretched by
@@ -67,6 +95,10 @@ constexpr qreal kRestRunAgent     = 64.0;
 // 24 is two agent discs with a gap between them.
 constexpr qreal kAgentSpacing = 24.0;
 constexpr qreal kRunSpacing   = 60.0;
+
+// Wider than an agent's, because a box's text runs sideways out of it and two
+// boxes packed to their rims have their labels written over each other.
+constexpr qreal kWorkSpacing = 46.0;
 
 // Hooke, and no more than Hooke. With the damping below this puts an agent at a
 // damping ratio just over 1: it slides into place in about a second and a half
@@ -208,6 +240,13 @@ constexpr int kLabelCrowdLimit = 20;
 
 constexpr char kSep = '\x1f';   // cannot appear in any id Claude Code writes
 
+// Unix milliseconds. Qt's rather than <chrono>'s, because this file already has
+// Qt and QDateTime is what the rest of the GUI would reach for.
+std::int64_t nowUnixMs()
+{
+    return QDateTime::currentMSecsSinceEpoch();
+}
+
 std::string sessionKey(const std::string& session)
 {
     return std::string("S") + kSep + session;
@@ -218,9 +257,55 @@ std::string runKey(const std::string& session, const std::string& run)
     return std::string("R") + kSep + session + kSep + run;
 }
 
+// The boxes. A distinct prefix each, so a task and a todo that happen to share
+// an id are still two nodes, and so a node keeps its position when it changes
+// nothing but its text.
+std::string taskKey(const std::string& session, const std::string& task)
+{
+    return std::string("K") + kSep + session + kSep + task;
+}
+
+// One per session, so it has no id of its own: the tool call in flight is a
+// property of the session, and giving it a per-call key would pop a new box
+// for every tool call instead of retitling the one that is there.
+std::string toolKey(const std::string& session)
+{
+    return std::string("T") + kSep + session;
+}
+
+std::string todoKey(const std::string& session, const std::string& todo)
+{
+    return std::string("D") + kSep + session + kSep + todo;
+}
+
+std::string planKey(const std::string& session)
+{
+    return std::string("P") + kSep + session;
+}
+
 std::string agentKey(const std::string& session, const std::string& agent)
 {
     return std::string("A") + kSep + session + kSep + agent;
+}
+
+// A box: something the session is doing, rather than something it spawned.
+// Everything that is true of one of these is true of all of them, which is why
+// this is a predicate and not five cases repeated at every call site.
+bool isWork(NodeKind kind)
+{
+    switch (kind) {
+    case NodeKind::Shell:
+    case NodeKind::Monitor:
+    case NodeKind::Tool:
+    case NodeKind::Todo:
+    case NodeKind::Plan:
+        return true;
+    case NodeKind::Session:
+    case NodeKind::Run:
+    case NodeKind::Agent:
+        break;
+    }
+    return false;
 }
 
 qreal massFor(NodeKind kind)
@@ -229,6 +314,11 @@ qreal massFor(NodeKind kind)
     case NodeKind::Session: return kSessionMass;
     case NodeKind::Run:     return kRunMass;
     case NodeKind::Agent:   return kAgentMass;
+    case NodeKind::Shell:
+    case NodeKind::Monitor:
+    case NodeKind::Tool:
+    case NodeKind::Todo:
+    case NodeKind::Plan:    return kWorkMass;
     }
     return kAgentMass;
 }
@@ -239,6 +329,11 @@ qreal radiusFor(NodeKind kind)
     case NodeKind::Session: return kSessionRadius;
     case NodeKind::Run:     return kRunRadius;
     case NodeKind::Agent:   return kAgentRadius;
+    case NodeKind::Shell:   return kShellRadius;
+    case NodeKind::Monitor: return kMonitorRadius;
+    case NodeKind::Tool:    return kToolRadius;
+    case NodeKind::Todo:    return kTodoRadius;
+    case NodeKind::Plan:    return kPlanRadius;
     }
     return kAgentRadius;
 }
@@ -324,6 +419,80 @@ void paintAgent(Node& n, const SubAgent& a)
         n.rim  = theme::c(kFg4);
         break;
     }
+}
+
+// The boxes. Every one of them is square, dim-filled and labelled beside
+// itself; what separates them is the glyph and whether the rim is solid.
+//
+// A solid rim means something is running right now. A broken one means armed
+// but idle, which is what a monitor is between its events and what a todo is
+// before anyone starts it. That distinction is the only state these carry, so
+// it is worth being consistent about.
+void paintShell(Node& n, const BackgroundTask& t)
+{
+    n.shape      = NodeShape::Box;
+    n.rimWidth   = 1.2;
+    n.labelColor = theme::c(kFg3);
+    n.glyph      = QChar('>');
+    n.fill       = theme::c(kElevated);
+    n.rim        = theme::c(kFg2);
+    (void)t;
+}
+
+void paintMonitor(Node& n)
+{
+    n.shape      = NodeShape::Box;
+    n.rimWidth   = 1.2;
+    n.labelColor = theme::c(kFg3);
+    n.glyph      = QChar('~');
+    n.fill       = theme::c(kSurface);
+    n.rim        = theme::c(kFg2);
+    // Armed, not working: a monitor between two events is running nothing.
+    n.dashed = true;
+}
+
+void paintTool(Node& n)
+{
+    n.shape      = NodeShape::Box;
+    n.rimWidth   = 1.0;
+    n.labelColor = theme::c(kFg4);
+    n.glyph      = QChar('.');
+    n.fill       = theme::c(kSurface);
+    n.rim        = theme::c(kFg3);
+}
+
+void paintTodo(Node& n, const TodoItem& item)
+{
+    n.shape      = NodeShape::Box;
+    n.rimWidth   = 1.0;
+    n.labelColor = theme::c(kFg4);
+    n.fill       = theme::c(kSurface);
+
+    if (item.done()) {
+        n.glyph = QChar('x');
+        n.rim   = theme::c(kFg4);
+        n.dashed = true;
+    } else if (item.active()) {
+        n.glyph = QChar('>');
+        n.rim   = theme::c(kFg2);
+        n.fill  = theme::c(kElevated);
+        n.labelColor = theme::c(kFg3);
+    } else {
+        n.glyph  = QChar(' ');
+        n.rim    = theme::c(kFg4);
+        n.dashed = true;
+    }
+}
+
+void paintPlan(Node& n)
+{
+    n.shape      = NodeShape::Box;
+    n.rimWidth   = 1.0;
+    n.labelColor = theme::c(kFg4);
+    n.glyph      = QChar('=');
+    n.fill       = theme::c(kSurface);
+    n.rim        = theme::c(kFg3);
+    n.dashed     = true;
 }
 
 } // namespace
@@ -462,8 +631,10 @@ std::size_t NodeGraph::touch(const std::string& key, NodeKind kind,
     n.radiusTarget = radiusFor(kind);
     n.restRunTarget   = kRestSessionRun;
     n.restAgentTarget = (kind == NodeKind::Session) ? kRestSessionAgent : kRestRunAgent;
+    n.restWorkTarget  = kRestSessionWork;
     n.restRun         = n.restRunTarget;
     n.restAgent       = n.restAgentTarget;
+    n.restWork        = n.restWorkTarget;
 
     // On a ray out of its parent, so the pop reads as emerging from it.
     if (const auto p = index_.find(parentKey); !parentKey.empty() && p != index_.end()) {
@@ -508,6 +679,11 @@ bool NodeGraph::setBoard(const AgentList& board, bool animate)
 {
     ++stamp_;
     bool changed = false;
+
+    // One clock for the whole fold. A monitor's node appears or not depending
+    // on whether its watch has run out, and two sessions judged a millisecond
+    // apart would be a refresh that disagrees with itself.
+    const std::int64_t now = nowUnixMs();
 
     for (const AgentCard& card : board) {
         // A session whose process is gone is not on this canvas. The graph is
@@ -610,9 +786,127 @@ bool NodeGraph::setBoard(const AgentList& board, bool animate)
         for (const std::size_t slot : agentSlots)
             nodes_[slot].labelHidden = crowded;
 
-        Node& s           = nodes_[si];
-        s.restRunTarget   = restFor(kRestSessionRun, kRunSpacing, liveRuns);
-        s.restAgentTarget = restFor(kRestSessionAgent, kAgentSpacing, loose);
+        // ---------------------------------------------- what the session is doing
+
+        // One helper for all five box kinds, because the only thing that
+        // differs between them is which paint function runs.
+        int work = 0;
+
+        const auto box = [&](const std::string& key, NodeKind kind, const QString& label,
+                             const QString& detail, auto&& paint) {
+            bool              fresh = false;
+            const std::size_t bi    = touch(key, kind, sKey, animate, &fresh);
+            changed |= fresh;
+
+            Node&        n   = nodes_[bi];
+            const QColor rim = n.rim;
+            changed |= n.label != label || n.detail != detail;
+            n.label  = label;
+            n.detail = detail;
+            paint(n);
+            changed |= n.rim != rim;
+            ++work;
+            return bi;
+        };
+
+        // Shells and monitors. Only tasks the log could name are drawn: an
+        // unnamed one is the foreground tool call this session is making right
+        // now, which the Tool node below already stands for, and drawing both
+        // would show one command twice. See taskCalls in agent_board.cpp for
+        // why a named task is exactly a backgrounded one.
+        for (const BackgroundTask& t : card.tasks) {
+            if (t.kind == TaskKind::Unknown || !t.live(now))
+                continue;
+
+            const QString label = t.label.empty()
+                                    ? QString::fromLatin1(taskKindLabel(t.kind))
+                                    : QString::fromStdString(t.label);
+
+            if (t.kind == TaskKind::Monitor) {
+                box(taskKey(card.sessionId, t.id), NodeKind::Monitor, label,
+                    QString::fromStdString(t.tail), [](Node& n) { paintMonitor(n); });
+            } else {
+                box(taskKey(card.sessionId, t.id), NodeKind::Shell, label,
+                    QString::fromStdString(t.tail),
+                    [&t](Node& n) { paintShell(n, t); });
+            }
+        }
+
+        // The tool call in flight. One per session, and only while the session
+        // is actually working: an idle session's last tool call is history, and
+        // a box for it would say the session is still doing something.
+        if (card.column == AgentColumn::Working && !card.activity.empty()) {
+            box(toolKey(card.sessionId), NodeKind::Tool,
+                QString::fromStdString(card.activity), QString(),
+                [](Node& n) { paintTool(n); });
+        }
+
+        // The task list. Finished items are kept: a list is read for how far
+        // through it the session is, and one that drops its completed items
+        // shows the same three boxes all afternoon.
+        //
+        // A blocked item hangs off the item blocking it rather than off the
+        // session, which is what turns a list into the shape it actually has.
+        // The links, the spring and the packing are the ones already here; a
+        // dependency chain is a branch, and nothing had to learn a second kind
+        // of edge to draw one.
+        //
+        // Only backwards, and only to one. Blocking is a graph and this is a
+        // tree: an item can be blocked by several, and blockedBy is written by
+        // something that does not promise the relation is acyclic, so a cycle
+        // would otherwise make two nodes each other's parent. Taking the
+        // earliest blocker by list position cannot close a loop, because every
+        // edge then points at a lower index.
+        std::unordered_map<std::string, std::size_t> order;
+        for (std::size_t i = 0; i < card.todos.size(); ++i)
+            order.emplace(card.todos[i].id, i);
+
+        for (std::size_t i = 0; i < card.todos.size(); ++i) {
+            const TodoItem& item = card.todos[i];
+
+            std::string parent = sKey;
+            std::size_t best   = i;
+            for (const std::string& blocker : item.blockedBy) {
+                const auto at = order.find(blocker);
+                if (at != order.end() && at->second < best) {
+                    best   = at->second;
+                    parent = todoKey(card.sessionId, blocker);
+                }
+            }
+
+            const QString label = QString::fromStdString(
+                item.active() && !item.activeForm.empty() ? item.activeForm : item.subject);
+
+            bool              fresh = false;
+            const std::size_t bi =
+                touch(todoKey(card.sessionId, item.id), NodeKind::Todo, parent, animate, &fresh);
+            changed |= fresh;
+
+            Node&        n   = nodes_[bi];
+            const QColor rim = n.rim;
+            changed |= n.label != label;
+            n.label  = label;
+            n.detail = QString();
+            paintTodo(n, item);
+            changed |= n.rim != rim;
+
+            // A chained item is not one of the session's own boxes, so it must
+            // not widen the ring they share.
+            if (parent == sKey)
+                ++work;
+            else
+                nodes_[bi].restWorkTarget = kRestTodoChain;
+        }
+
+        for (const PlanDoc& plan : card.plans) {
+            box(planKey(card.sessionId), NodeKind::Plan, QString::fromStdString(plan.title),
+                QString(), [](Node& n) { paintPlan(n); });
+        }
+
+        Node& s            = nodes_[si];
+        s.restRunTarget    = restFor(kRestSessionRun, kRunSpacing, liveRuns);
+        s.restAgentTarget  = restFor(kRestSessionAgent, kAgentSpacing, loose);
+        s.restWorkTarget   = restFor(kRestSessionWork, kWorkSpacing, work);
 
         for (const auto& [runId, slot] : runs) {
             nodes_[slot].restAgentTarget =
@@ -634,6 +928,7 @@ bool NodeGraph::setBoard(const AgentList& board, bool animate)
             n.radius    = n.radiusTarget;
             n.restRun   = n.restRunTarget;
             n.restAgent = n.restAgentTarget;
+            n.restWork  = n.restWorkTarget;
         }
     }
 
@@ -763,7 +1058,9 @@ void NodeGraph::step(qreal dt)
             continue;
         Node& parent = nodes_[ps];
 
-        qreal rest = (child.kind == NodeKind::Run) ? parent.restRun : parent.restAgent;
+        qreal rest = child.kind == NodeKind::Run ? parent.restRun
+                   : isWork(child.kind)         ? parent.restWork
+                                                : parent.restAgent;
         if (child.phase == NodePhase::Dying) {
             const qreal t = std::clamp(child.animMs / kDeathMs, 0.0, 1.0);
             rest *= 1.0 + (kDeathRestFraction - 1.0) * t;
@@ -816,6 +1113,7 @@ void NodeGraph::advance(qreal seconds)
         n.radius += (n.radiusTarget - n.radius) * a;
         n.restRun += (n.restRunTarget - n.restRun) * a;
         n.restAgent += (n.restAgentTarget - n.restAgent) * a;
+        n.restWork += (n.restWorkTarget - n.restWork) * a;
 
         n.animMs += ms;
 
@@ -883,6 +1181,7 @@ void NodeGraph::settle(int steps)
         n.radius    = n.radiusTarget;
         n.restRun   = n.restRunTarget;
         n.restAgent = n.restAgentTarget;
+        n.restWork  = n.restWorkTarget;
     }
     for (int i = 0; i < steps; ++i)
         step(kFixedStep);

@@ -8,6 +8,8 @@ qt_add_executable(ProjectMan WIN32
     project_model.cpp
     widgets.cpp
     dispatch_run_window.cpp
+    claude_files.cpp
+    claude_state.cpp
     agent_board.cpp
     agent_board_panel.cpp
     node_graph.cpp

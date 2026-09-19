@@ -86,7 +86,9 @@ private:
     ProjectList projects_;   // guarded by mutex_
 
     // Touched only by the worker, which is the one thread that calls read().
+    // Both hold caches keyed by session id and neither is thread-safe.
     SessionFileReader sessions_;
+    TaskReader        tasks_;
 };
 
 // Every Claude Code session on this machine, as four columns of cards that

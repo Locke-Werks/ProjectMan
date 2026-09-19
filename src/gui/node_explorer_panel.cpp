@@ -79,6 +79,28 @@ constexpr qreal kProgressWidth = 2.5;
 // A node smaller than this is not worth the two draw calls.
 constexpr qreal kMinDrawRadius = 0.4;
 
+// Back to front. Two passes run over this, bodies then labels, and both want
+// the same order.
+constexpr NodeKind kDrawOrder[] = {
+    NodeKind::Session,
+    NodeKind::Run,
+    NodeKind::Agent,
+    NodeKind::Plan,
+    NodeKind::Todo,
+    NodeKind::Tool,
+    NodeKind::Monitor,
+    NodeKind::Shell,
+};
+
+// The boxes. Rounded just enough to not read as a hard pixel square next to a
+// canvas of circles.
+constexpr qreal kBoxCorner        = 2.5;
+constexpr qreal kGlyphMinRadiusPx = 6.0;
+
+// A box's second line, under its label: what the shell is saying right now.
+constexpr qreal kDetailGap   = 2.0;
+constexpr int   kDetailAlpha = 150;
+
 QColor withAlpha(QColor c, qreal a)
 {
     // setAlpha(int) rather than setAlphaF: the F-suffixed QColor setters take a
@@ -135,14 +157,24 @@ void NodeExplorerPanel::publishCounts()
         const int sessions = graph_.count(NodeKind::Session);
         const int runs     = graph_.count(NodeKind::Run);
         const int agents   = graph_.count(NodeKind::Agent);
+        const int shells   = graph_.count(NodeKind::Shell);
+        const int monitors = graph_.count(NodeKind::Monitor);
 
-        // What the three node sizes are, rather than a second copy of the
-        // board's own summary. Terms drop out at zero the way the board's do.
+        // What is on the canvas, rather than a second copy of the board's own
+        // summary. Terms drop out at zero the way the board's do, which is what
+        // keeps this readable: on an ordinary machine it says "2 sessions" and
+        // only grows when there is something to grow for. Todos, plans and the
+        // tool in flight are left out on purpose: they are always there when a
+        // session is working and counting them says nothing.
         text = QStringLiteral("%1 session%2").arg(sessions).arg(sessions == 1 ? "" : "s");
         if (runs > 0)
             text += QStringLiteral("  %1 run%2").arg(runs).arg(runs == 1 ? "" : "s");
         if (agents > 0)
             text += QStringLiteral("  %1 agent%2").arg(agents).arg(agents == 1 ? "" : "s");
+        if (shells > 0)
+            text += QStringLiteral("  %1 shell%2").arg(shells).arg(shells == 1 ? "" : "s");
+        if (monitors > 0)
+            text += QStringLiteral("  %1 monitor%2").arg(monitors).arg(monitors == 1 ? "" : "s");
     }
 
     if (text == counts_)
@@ -251,15 +283,18 @@ void NodeExplorerPanel::paintEvent(QPaintEvent*)
 
     drawLinks(p);
 
-    // Largest first, so a small node is never hidden under a big one.
-    for (const NodeKind kind : { NodeKind::Session, NodeKind::Run, NodeKind::Agent }) {
+    // Largest first, so a small node is never hidden under a big one. The boxes
+    // come last of the bodies: they are what the session is doing right now and
+    // an agent disc sliding over one would hide the live thing behind the
+    // structural one.
+    for (const NodeKind kind : kDrawOrder) {
         for (const Node& n : graph_.nodes()) {
             if (n.kind == kind)
                 drawNode(p, n);
         }
     }
-    // Then every label, so no disc can cover text.
-    for (const NodeKind kind : { NodeKind::Session, NodeKind::Run, NodeKind::Agent }) {
+    // Then every label, so no body can cover text.
+    for (const NodeKind kind : kDrawOrder) {
         for (const Node& n : graph_.nodes()) {
             if (n.kind == kind)
                 drawLabel(p, n);
@@ -322,8 +357,31 @@ void NodeExplorerPanel::drawNode(QPainter& p, const Node& n) const
         ring(kHaloOuter, kHaloOuterAlpha);
     }
 
-    p.setPen(QPen(withAlpha(n.rim, n.alpha), n.rimWidth));
+    QPen rim(withAlpha(n.rim, n.alpha), n.rimWidth);
+    if (n.dashed) {
+        // In rim widths, so the dash keeps its proportions as the camera zooms.
+        rim.setDashPattern({ 2.4, 2.0 });
+    }
+    p.setPen(rim);
     p.setBrush(withAlpha(n.fill, n.alpha));
+
+    if (n.shape == NodeShape::Box) {
+        const QRectF body(c.x() - r, c.y() - r, 2.0 * r, 2.0 * r);
+        p.drawRoundedRect(body, kBoxCorner, kBoxCorner);
+
+        // The glyph is what tells four kinds of box apart, so it is drawn
+        // whenever the box is big enough to hold a character at all and
+        // dropped, rather than shrunk, below that.
+        if (!n.glyph.isNull() && n.glyph != QChar(' ') && r >= kGlyphMinRadiusPx) {
+            QFont font = theme::mono(static_cast<int>(std::clamp(r * 1.1, 7.0, 13.0)));
+            font.setBold(true);
+            p.setFont(font);
+            p.setPen(withAlpha(n.rim, n.alpha));
+            p.drawText(body, Qt::AlignCenter, QString(n.glyph));
+        }
+        return;   // no progress arc on a box
+    }
+
     p.drawEllipse(c, r, r);
 
     if (n.progress < 0.0)
@@ -369,6 +427,18 @@ void NodeExplorerPanel::drawLabel(QPainter& p, const Node& n) const
             return;
         under = false;
         break;
+    // Every box labels itself the way a loose agent does, beside rather than
+    // under: a box is wider than an agent and a label centred under a row of
+    // them runs into its neighbours.
+    case NodeKind::Shell:
+    case NodeKind::Monitor:
+    case NodeKind::Tool:
+    case NodeKind::Todo:
+    case NodeKind::Plan:
+        if (r < kLabelMinRadiusPx)
+            return;
+        under = false;
+        break;
     }
 
     const QFontMetricsF fm(font);
@@ -403,7 +473,25 @@ void NodeExplorerPanel::drawLabel(QPainter& p, const Node& n) const
     const qreal   adv = fm.horizontalAdvance(cut);
     const qreal   x   = n.labelRight ? c.x() + r + kLabelGap : c.x() - r - kLabelGap - adv;
 
-    p.drawText(QPointF(x, c.y() + (fm.ascent() - fm.descent()) * 0.5), cut);
+    // One line centres on the node. Two share it, so the pair still reads as
+    // belonging to the box rather than hanging off the bottom of it.
+    const bool  two  = !n.detail.isEmpty();
+    const qreal mid  = (fm.ascent() - fm.descent()) * 0.5;
+    const qreal rise = two ? (fm.height() + kDetailGap) * 0.5 : 0.0;
+
+    p.drawText(QPointF(x, c.y() + mid - rise), cut);
+    if (!two)
+        return;
+
+    // What the shell is saying now, under what it was asked to do. Dimmer,
+    // because the command is the identity and the output is the weather.
+    const QString tail = fm.elidedText(n.detail, Qt::ElideRight, avail);
+    const qreal   tadv = fm.horizontalAdvance(tail);
+    const qreal   tx   = n.labelRight ? c.x() + r + kLabelGap : c.x() - r - kLabelGap - tadv;
+
+    p.setPen(withAlpha(withAlpha(theme::c(kFg4), static_cast<qreal>(kDetailAlpha) / 255.0),
+                       n.alpha));
+    p.drawText(QPointF(tx, c.y() + mid - rise + fm.height() + kDetailGap), tail);
 }
 
 void NodeExplorerPanel::drawNotice(QPainter& p, const QString& text) const

@@ -33,10 +33,33 @@ namespace pm::gui {
 inline constexpr qreal kFixedStep = 1.0 / 120.0;
 
 enum class NodeKind {
-    Session,   // one live Claude Code session
+    Session,   // one live Claude Code session, in a terminal or under the daemon
     Run,       // one Workflow tool run inside it
     Agent,     // one subagent, of a run or of the session itself
+
+    // What a session is doing rather than what it has spawned. All four hang
+    // off the session, none of them has children, and none is an agent: they
+    // are drawn as boxes precisely so the eye can tell the things that think
+    // from the things that are being done.
+    Shell,     // a background Bash or PowerShell call, still writing
+    Monitor,   // a Monitor watch, still armed
+    Tool,      // the tool call in flight this instant
+    Todo,      // one item of the session's task list
+    Plan,      // the plan document the session wrote
 };
+
+// A disc is an agent; a box is work. Two shapes and no more, because a legend
+// nobody is shown has to be learnable by looking at it once.
+//
+// The box is a square rather than a chip wide enough to hold its command, and
+// that is a deliberate trade. A box sized to its text is 110 world units across
+// against a session's 26, which inverts the hierarchy the layout is built on:
+// the repulsion is scaled by the product of two radii, so the widest thing on
+// the canvas would also be the thing pushing hardest, and a session with four
+// shells would be flung apart by its own shells. The square keeps the physics
+// the sizes were tuned for and the text goes beside it, where it has the whole
+// margin to be read in instead of a fixed 110 units.
+enum class NodeShape { Disc, Box };
 
 // A node is born, lives, and is retired when its work ends. Dying is a real
 // state rather than a deletion because the node goes on being simulated while
@@ -62,11 +85,15 @@ struct Node {
     qreal mass         = 1;
 
     // What this node hands its children as a spring rest length. A session
-    // holds two, because its runs sit further out than its own loose agents.
-    qreal restRun         = 0;
-    qreal restRunTarget   = 0;
-    qreal restAgent       = 0;
-    qreal restAgentTarget = 0;
+    // holds three, because its runs sit further out than its own loose agents,
+    // and the boxes saying what it is doing sit further out again: they are
+    // wider than they look, since each carries two lines of text off its side.
+    qreal restRun          = 0;
+    qreal restRunTarget    = 0;
+    qreal restAgent        = 0;
+    qreal restAgentTarget  = 0;
+    qreal restWork         = 0;
+    qreal restWorkTarget   = 0;
 
     // Sessions only: how far its furthest descendant reaches, which is what
     // keeps two sessions' subtrees from sitting on top of each other.
@@ -91,6 +118,22 @@ struct Node {
     bool    progressBad = false; // the run has a failed agent in it
     bool    attention   = false; // the session is in NEEDS YOU
     bool    labelRight  = true;  // which side its label sits on
+
+    NodeShape shape = NodeShape::Disc;
+
+    // The second line, dimmer, under the label. A shell's most recent line of
+    // output: what it is saying now, as against `label`, which is what it was
+    // asked to do.
+    QString detail;
+
+    // A single character drawn inside a box, which is what makes four kinds of
+    // box tell themselves apart at a glance without four colours.
+    QChar glyph;
+
+    // A monitor is drawn with a broken rim. It is armed rather than working:
+    // nothing is running between its events, and a solid box would claim
+    // otherwise.
+    bool dashed = false;
 
     int           spawnOrdinal = 0;
     std::uint64_t seen         = 0;

@@ -109,6 +109,16 @@ std::string stringField(const json::Value* object, const char* key)
     return (v && v->type == json::Value::Type::String) ? v->string : std::string();
 }
 
+std::int64_t intField(const json::Value* object, const char* key)
+{
+    if (!object)
+        return 0;
+    const json::Value* v = object->find(key);
+    if (!v || v->type != json::Value::Type::Number)
+        return 0;
+    return v->isInteger ? v->integer : static_cast<std::int64_t>(v->number);
+}
+
 // First line only, cut to fit, with a marker for what was cut.
 //
 // A copy of claude_stream.cpp's, which is file-local there, plus one thing it
@@ -329,8 +339,39 @@ int receiveBody()
     if (event.empty())
         return kOk;   // nothing the board could file it under
 
+    const bool preTool  = event == "PreToolUse";
+    const bool postTool = event == "PostToolUse";
+
     const std::string tool =
-        event == "PreToolUse" ? stringField(&payload, "tool_name") : std::string();
+        (preTool || postTool) ? stringField(&payload, "tool_name") : std::string();
+
+    // PostToolUse is registered for one field and is dropped here without it.
+    // See kEvents: this is what keeps the busiest event on the machine from
+    // costing the log a line per tool call.
+    //
+    // The field has two names and they are not interchangeable: Bash spells it
+    // backgroundTaskId, Monitor spells it taskId, and each carries the same
+    // thing, the id of the file under %TEMP%\claude that the call writes its
+    // output into. Verified on CLI 2.1.278 by reading both tool results back
+    // out of a transcript. Reading only the first of them is what made monitors
+    // invisible on the canvas while background shells worked.
+    //
+    // The wrapper has two names as well, because the hook payload and the
+    // transcript record disagree about it and which one a given CLI hands a
+    // hook is not documented. An unrecognised shape reads as absent, which
+    // drops the line, and an id that matches no file simply draws nothing.
+    std::string backgroundTask;
+    if (postTool) {
+        const json::Value* response = payload.find("tool_response");
+        if (!response)
+            response = payload.find("toolUseResult");
+
+        backgroundTask = stringField(response, "backgroundTaskId");
+        if (backgroundTask.empty())
+            backgroundTask = stringField(response, "taskId");
+        if (backgroundTask.empty())
+            return kOk;
+    }
 
     // Every branch goes through the same cap. A Notification message has no
     // length limit of its own, and one long enough would write a log line of
@@ -378,10 +419,35 @@ int receiveBody()
             record.emplace_back("agentType", json::makeString(agentType));
     }
 
-    if (event == "PreToolUse") {
+    // On PreToolUse this ties the parent's own Agent call to the subagent it
+    // spawned. On PostToolUse it is the other half of the background task join:
+    // the id below says which output file, and this says which PreToolUse line
+    // carries the command that opened it.
+    if (preTool || postTool) {
         const std::string toolUse = stringField(&payload, "tool_use_id");
         if (!toolUse.empty())
             record.emplace_back("toolUse", json::makeString(toolUse));
+    }
+
+    if (!backgroundTask.empty())
+        record.emplace_back("task", json::makeString(backgroundTask));
+
+    // How long a Monitor stays armed, in milliseconds, off its own tool_input.
+    //
+    // This is the only thing on the machine that says when a monitor stops. A
+    // background shell holds its output file open for exactly as long as it
+    // runs, so an exclusive open answers the question; a monitor does not hold
+    // the file at all, verified by sampling two live monitors sixty times over
+    // nine seconds while both were emitting: zero samples locked. Nothing else
+    // it writes changes when it ends either, so a reader with no deadline shows
+    // a monitor that expired an hour ago as still watching.
+    //
+    // Recorded on PreToolUse because tool_input is where it lives, and the
+    // PostToolUse that names the task carries no input. The two are tied by
+    // tool_use_id like everything else here.
+    if (preTool && tool == "Monitor") {
+        if (const std::int64_t ttl = intField(payload.find("tool_input"), "timeout_ms"); ttl > 0)
+            record.emplace_back("ttl", json::makeInt(ttl));
     }
 
     const fs::path log = eventLogPath();
@@ -429,9 +495,19 @@ int receive()
 
 // ------------------------------------------------------------- registration
 
-// Every event install registers. PostToolUse is deliberately absent: a tool
-// that has already returned is the previous state of the card, bought by
-// doubling the write rate on the busiest event there is.
+// Every event install registers. PostToolUse is here for exactly one field and
+// writes nothing without it, which is what makes it affordable: a tool that has
+// already returned is the previous state of the card, and registering it to
+// mirror every call would double the write rate on the busiest event there is.
+// The receiver drops a PostToolUse carrying no background task id before it
+// opens anything, so the common case costs a parse and a lookup and the log
+// grows by one line per background shell rather than one per tool call.
+//
+// That field is the only place the id of a background shell or a monitor
+// appears. Claude Code returns it to the model and writes the task's output to
+// a file named after it, and nothing in the PreToolUse payload predicts it, so
+// without this the node explorer can see a shell running and never say which
+// command it is.
 //
 // SubagentStart and SubagentStop are the exception to that reasoning, and the
 // only pair that is. They are the sole thing on the machine that says a
@@ -446,6 +522,7 @@ constexpr const char* kEvents[] = {
     "SessionStart",
     "UserPromptSubmit",
     "PreToolUse",
+    "PostToolUse",
     "Notification",
     "Stop",
     "SubagentStart",
