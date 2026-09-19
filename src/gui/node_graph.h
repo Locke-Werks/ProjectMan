@@ -168,7 +168,9 @@ public:
     // Every node Alive and slower than the sleep floor.
     bool settled() const;
 
-    // The box the drawn discs occupy. Null when there is nothing to draw.
+    // The box the live nodes occupy at the size they are settling to. Null when
+    // nothing is left to frame, which holds the camera where it was rather than
+    // sending it somewhere on the way out.
     QRectF bounds() const;
 
     const std::vector<Node>& nodes() const { return nodes_; }

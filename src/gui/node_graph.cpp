@@ -153,18 +153,25 @@ constexpr qreal kDeathRestFraction = 0.25;
 
 // ---------------------------------------------------------------- the camera
 
-// Screen-space margin in logical pixels. Wide enough at the sides that a name
-// centred under a node has somewhere to be without the fit having to know how
-// wide the name is.
-constexpr qreal kMarginX = 90.0;
-constexpr qreal kMarginY = 56.0;
+// Screen-space margin in logical pixels. The graph fills everything inside it,
+// whatever the graph happens to be: one session alone is a large circle rather
+// than a small one adrift in a black field, and the canvas earns its space at
+// every size.
+constexpr qreal kMarginX = 100.0;
+constexpr qreal kMarginY = 100.0;
 
-// A lone session is 52 world units across. At 3.0 it draws 156px wide, which
-// reads as one node on a canvas rather than as a planet, and it is as far as
-// the zoom is allowed to go: a machine running two sessions and nothing else
-// should look sparse, because it is, but not lost in the middle of the canvas.
-constexpr qreal kMinScale = 0.22;
-constexpr qreal kMaxScale = 3.0;
+// Room under the content for a session's name, which is drawn at a fixed size
+// below its node and is therefore not in the box being fitted. Taken off the
+// available height rather than added to the box, which would make the fit a
+// function of the scale it produces.
+constexpr qreal kLabelAllowance = 30.0;
+
+// Not a look, a guard. The fit decides the scale, and the only way it asks for
+// more than this is a box that has collapsed to nothing, which is a bug rather
+// than a picture. The floor is the same in reverse: past it the nodes are
+// smaller than their own hairlines.
+constexpr qreal kMinScale = 0.15;
+constexpr qreal kMaxScale = 100.0;
 
 // Per second, frame-rate corrected where it is used. 3.2 is 96% of the way
 // there in a second.
@@ -175,9 +182,12 @@ constexpr qreal kCameraRate = 3.2;
 constexpr qreal kCameraSnapScale  = 0.002;   // in log space
 constexpr qreal kCameraSnapCentre = 0.4;     // world units
 
-// Grow at once, shrink only after the smaller box has held.
-constexpr qreal kFitShrinkMargin = 40.0;
-constexpr qreal kFitShrinkHoldMs = 400.0;
+// Grow at once, shrink only after the smaller box has held. The slack is a
+// fraction of the held fit rather than a distance in world units: the zoom now
+// runs from one session filling the canvas to a hundred agents in it, and a
+// fixed slack is either a third of the frame or invisible depending on which.
+constexpr qreal kFitShrinkSlack   = 0.04;
+constexpr qreal kFitShrinkHoldMs  = 400.0;
 
 // Nothing is moving. 0.5 world units per second is a tenth of a pixel a frame
 // at the zoom clamp, which is under the threshold at which anything is visible.
@@ -338,8 +348,9 @@ void Camera::retarget(const QRectF& content, qreal elapsedMs)
         return;
     }
 
-    const QRectF slack = content.adjusted(-kFitShrinkMargin, -kFitShrinkMargin,
-                                          kFitShrinkMargin, kFitShrinkMargin);
+    const qreal  sx    = fit_.width() * kFitShrinkSlack;
+    const qreal  sy    = fit_.height() * kFitShrinkSlack;
+    const QRectF slack = content.adjusted(-sx, -sy, sx, sy);
     if (!fit_.contains(slack)) {
         shrinkHeldMs_ = 0;
         return;
@@ -358,7 +369,7 @@ qreal Camera::targetScale(const QSizeF& view) const
         return scale_;
 
     const qreal availW = std::max(40.0, view.width() - 2.0 * kMarginX);
-    const qreal availH = std::max(40.0, view.height() - 2.0 * kMarginY);
+    const qreal availH = std::max(40.0, view.height() - 2.0 * kMarginY - kLabelAllowance);
     const qreal boxW   = std::max(1.0, fit_.width());
     const qreal boxH   = std::max(1.0, fit_.height());
 
@@ -926,7 +937,15 @@ QRectF NodeGraph::bounds() const
 {
     QRectF box;
     for (const Node& n : nodes_) {
-        const qreal r = n.radius * n.popScale;
+        // A node on its way out stops claiming space the moment it starts
+        // dying, and every other node claims the size it is going to be rather
+        // than the size it is this frame. Both are the same guard: the fit
+        // drives the zoom all the way to the margins now, so a radius sliding
+        // toward zero would drive the scale toward the clamp and the camera
+        // would lunge at whatever was leaving.
+        if (n.phase == NodePhase::Dying)
+            continue;
+        const qreal r = n.radiusTarget;
         if (r <= 0.01)
             continue;
         box = box.united(QRectF(n.pos.x() - r, n.pos.y() - r, 2.0 * r, 2.0 * r));

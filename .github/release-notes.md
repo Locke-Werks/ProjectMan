@@ -2,6 +2,8 @@ A control surface over the projects tree.
 
 `pm` lists every project with its git state and outstanding work, and hands the current terminal to Claude Code in the one you pick. `ProjectMan.exe` shows the same data as a desktop dashboard and launches into a new Windows Terminal window.
 
+New in 1.0.1: the node explorer fills the canvas. The view fits whatever is on it to within about a hundred pixels of every edge at any size, so one session on its own is a large circle rather than a small one adrift in a black field, and the zoom eases out and re-centres as work arrives and leaves. The fit reads each node at the size it is settling to rather than the size it is mid-pop, so nothing lunges at the camera on its way out.
+
 New in 1.0.0: **a node explorer.** A third tab draws the same sessions as what they are: a live session is a large node, every workflow run and subagent under it is a smaller one tied to it, and the whole thing settles under repulsion and link tension. Work pops in when it starts and pops out when it ends, the rest slides out of the way, and the view zooms itself to keep the structure in frame. It is a view and nothing else: no panning, no zoom control, no selection. One watcher feeds it and the board, so the two cannot disagree about the same instant, and it stops repainting entirely once the graph has settled.
 
 Also new in 1.0.0: a workflow run's line counts the way Claude Code counts it, done out of started rather than running out of started, and the agents inside a run are listed under it by the label their script gave them. Both come from the run's own journal, which is the only file that says what a run is doing while it is doing it, so neither needs hooks installed.
