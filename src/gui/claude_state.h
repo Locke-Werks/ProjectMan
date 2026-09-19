@@ -89,6 +89,15 @@ struct BackgroundTask {
     // monitor. Filled by the join in buildBoard, empty without hooks.
     std::string label;
 
+    // The subagent that opened it, empty when the session opened it itself.
+    //
+    // Every task a session and its subagents run writes into ONE directory, so
+    // the files cannot say who owns what and this can only come from the hook
+    // log, where a subagent's events carry agent_id. Without it a subagent's
+    // shell is drawn hanging off the session, which reads as the session having
+    // run a command it never ran.
+    std::string agentId;
+
     // The last non-empty line of output, which is what the call is saying right
     // now. Cut to kTailChars; the file itself is never held in full.
     std::string tail;

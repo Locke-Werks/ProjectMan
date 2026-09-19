@@ -58,6 +58,11 @@ private:
     void drawLinks(QPainter& p) const;
     void drawNode(QPainter& p, const Node& n) const;
     void drawLabel(QPainter& p, const Node& n) const;
+
+    // The session's task list, as a column of rows beside its node. Its own
+    // function rather than a branch of drawLabel because it lays out rows, a
+    // mark column and an indent, none of which a label has.
+    void drawTaskBlock(QPainter& p, const Node& n) const;
     void drawNotice(QPainter& p, const QString& text) const;
 
     NodeGraph graph_;

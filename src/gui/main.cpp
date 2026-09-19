@@ -46,6 +46,13 @@ int main(int argc, char** argv)
     }
 
     pm::gui::MainWindow w(std::move(cfg));
-    w.show();
+
+    // Maximized, not merely large. Every tab here is a view that earns more
+    // room: the table shows more projects, the board shows more columns without
+    // scrolling, and the node explorer fits its graph to whatever it is given,
+    // so a bigger window is a bigger graph rather than more black around the
+    // same one. The constructor's resize() is still what an unmaximized window
+    // restores to.
+    w.showMaximized();
     return app.exec();
 }

@@ -369,6 +369,33 @@ void answered(Building& b)
     b.notice.clear();
 }
 
+// File the call on the card, newest last, oldest dropped past the cap.
+//
+// Keyed by tool_use_id so the same call read twice is one entry: the log is
+// re-read whole on every refresh, and a call that appeared last time must not
+// appear again as a second box beside itself.
+void rememberTool(Building& b, const AgentEvent& ev)
+{
+    if (ev.toolUseId.empty() || ev.tool.empty())
+        return;
+
+    for (ToolCall& t : b.card.tools) {
+        if (t.id == ev.toolUseId)
+            return;
+    }
+
+    ToolCall call;
+    call.id      = ev.toolUseId;
+    call.tool    = ev.tool;
+    call.detail  = ev.detail;
+    call.agentId = ev.agentId;
+    call.tsMs    = ev.tsMs;
+    b.card.tools.push_back(std::move(call));
+
+    if (b.card.tools.size() > kMaxRecentTools)
+        b.card.tools.erase(b.card.tools.begin());
+}
+
 void applyEvent(Building& b, const AgentEvent& ev)
 {
     if (b.card.cwd.empty())
@@ -390,6 +417,7 @@ void applyEvent(Building& b, const AgentEvent& ev)
         } else if (ev.event == "PreToolUse") {
             if (std::string line = toolLine(ev); !line.empty())
                 a.activity = std::move(line);
+            rememberTool(b, ev);
             // A tool call is proof it was running at the time, and the log is
             // walked forward, so a later Stop still wins.
             if (a.state == AgentState::Spawned)
@@ -408,6 +436,7 @@ void applyEvent(Building& b, const AgentEvent& ev)
     if (ev.event == "PreToolUse") {
         if (std::string line = toolLine(ev); !line.empty())
             b.card.activity = std::move(line);
+        rememberTool(b, ev);
         answered(b);
     } else if (ev.event == "UserPromptSubmit") {
         if (!ev.detail.empty())
@@ -495,11 +524,12 @@ void applyJob(Building& b, const BackgroundJob& job)
 
 // ------------------------------------------------------- the background tasks
 
-// What opened a background task: the tool, the text it was given, and when it
-// stops mattering.
+// What opened a background task: the tool, the text it was given, who ran it,
+// and when it stops mattering.
 struct TaskCall {
     TaskKind    kind = TaskKind::Unknown;
     std::string label;
+    std::string agentId;
 
     // Monitors only. The PostToolUse timestamp plus the watch's declared
     // timeout, which is when it can no longer be armed. Zero for a shell, which
@@ -543,6 +573,11 @@ std::unordered_map<std::string, TaskCall> taskCalls(const std::vector<AgentEvent
         // has rolled off the back of the log still leaves the kind known and
         // only costs the label.
         call.kind = kindForTool(ev.tool);
+
+        // And it carries agent_id when a subagent made the call, which is the
+        // only place that fact exists: the task files all share one directory
+        // per session whoever opened them.
+        call.agentId = ev.agentId;
 
         if (const auto at = calls.find(ev.toolUseId); at != calls.end()) {
             call.label = at->second->detail;
@@ -1111,6 +1146,7 @@ AgentList buildBoard(const std::vector<RegistryEntry>&  registry,
                     continue;
                 t.kind        = at->second.kind;
                 t.label       = at->second.label;
+                t.agentId     = at->second.agentId;
                 t.expiresAtMs = at->second.expiresAtMs;
             }
         }

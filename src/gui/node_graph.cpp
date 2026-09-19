@@ -30,7 +30,13 @@ constexpr qreal kAgentRadius   = 8.0;
 constexpr qreal kShellRadius   = 10.0;
 constexpr qreal kMonitorRadius = 10.0;
 constexpr qreal kToolRadius    = 7.0;
-constexpr qreal kTodoRadius    = 6.0;
+constexpr qreal kTasksRadius   = 9.0;
+
+// Half a row of the block, per row, added to what the task node asks the layout
+// for. Ten rows at font size 10 is about 140 logical pixels tall, so half of
+// that is 70 world units at scale 1, and this lands near it without the node
+// itself growing at all. See Node::spaceRadius.
+constexpr qreal kTasksRowSpace = 7.0;
 constexpr qreal kPlanRadius    = 9.0;
 
 // A run that spawned forty agents should read as a bigger thing than one that
@@ -83,10 +89,10 @@ constexpr qreal kRestRunAgent     = 64.0;
 // text not to cross the ring inside it.
 constexpr qreal kRestSessionWork = 104.0;
 
-// One task-list item to the next one it unblocks. Short, because a chain is
-// read as a chain: far enough apart to see the link, close enough that four
-// steps of it stay one object rather than four.
-constexpr qreal kRestTodoChain = 52.0;
+// A subagent to a shell it opened. Shorter than the session's ring: an agent is
+// half the radius of a session and carries far less around it, so a box at the
+// session's distance would read as belonging to the session behind it.
+constexpr qreal kRestAgentWork = 58.0;
 
 // n children of one parent pack into a disc of radius spacing*sqrt(n/pi).
 // Feeding that back in as the rest length is what keeps a forty-agent run in
@@ -162,6 +168,15 @@ constexpr qreal kResurrectFraction = 0.35;
 constexpr qreal kBirthMs = 340.0;
 constexpr qreal kDeathMs = 260.0;
 
+// How long a tool call stays on the canvas after it started.
+//
+// Nothing records when a tool call ends, so this is the whole lifetime of the
+// box and not a grace period after one. Twelve seconds against a board that
+// rebuilds every five: long enough that a call is still there when the next
+// refresh lands, so a box fades rather than blinking, and short enough that
+// what is on screen is what is happening now.
+constexpr std::int64_t kToolLingerMs = 12000;
+
 // easeOutBack and easeInBack. c1 = c3 - 1 in both, which is what makes the
 // curve exactly zero at the closed end: a newborn starts at no radius at all
 // rather than at a visible dot, and a corpse ends at nothing.
@@ -214,10 +229,16 @@ constexpr qreal kCameraRate = 3.2;
 constexpr qreal kCameraSnapScale  = 0.002;   // in log space
 constexpr qreal kCameraSnapCentre = 0.4;     // world units
 
-// Grow at once, shrink only after the smaller box has held. The slack is a
-// fraction of the held fit rather than a distance in world units: the zoom now
+// Grow at once; shrink or recentre only after the new box has held. The slack
+// is a fraction of the held fit rather than a distance in world units: the zoom
 // runs from one session filling the canvas to a hundred agents in it, and a
 // fixed slack is either a third of the frame or invisible depending on which.
+//
+// It is the deadband for both tests in retarget, which is what keeps a settling
+// graph from dragging the camera around by a few units a frame. The hold is
+// what makes a departure read as deliberate rather than twitchy: the node takes
+// kDeathMs to leave, and the camera waits this long after the box has stopped
+// changing before it commits to the new one. The glide itself is kCameraRate.
 constexpr qreal kFitShrinkSlack   = 0.04;
 constexpr qreal kFitShrinkHoldMs  = 400.0;
 
@@ -265,17 +286,21 @@ std::string taskKey(const std::string& session, const std::string& task)
     return std::string("K") + kSep + session + kSep + task;
 }
 
-// One per session, so it has no id of its own: the tool call in flight is a
-// property of the session, and giving it a per-call key would pop a new box
-// for every tool call instead of retitling the one that is there.
-std::string toolKey(const std::string& session)
+// One per CALL, keyed by tool_use_id.
+//
+// It was one per session, holding whatever had been called most recently, and
+// that was the wrong shape: a session making three calls a second retitled one
+// box faster than it could be read. A key per call gives each one its own node,
+// its own birth, and its own death when its linger runs out.
+std::string toolKey(const std::string& session, const std::string& call)
 {
-    return std::string("T") + kSep + session;
+    return std::string("T") + kSep + session + kSep + call;
 }
 
-std::string todoKey(const std::string& session, const std::string& todo)
+// One per session: the list is a block, not a node per item.
+std::string tasksKey(const std::string& session)
 {
-    return std::string("D") + kSep + session + kSep + todo;
+    return std::string("D") + kSep + session;
 }
 
 std::string planKey(const std::string& session)
@@ -297,7 +322,7 @@ bool isWork(NodeKind kind)
     case NodeKind::Shell:
     case NodeKind::Monitor:
     case NodeKind::Tool:
-    case NodeKind::Todo:
+    case NodeKind::Tasks:
     case NodeKind::Plan:
         return true;
     case NodeKind::Session:
@@ -317,7 +342,7 @@ qreal massFor(NodeKind kind)
     case NodeKind::Shell:
     case NodeKind::Monitor:
     case NodeKind::Tool:
-    case NodeKind::Todo:
+    case NodeKind::Tasks:
     case NodeKind::Plan:    return kWorkMass;
     }
     return kAgentMass;
@@ -332,7 +357,7 @@ qreal radiusFor(NodeKind kind)
     case NodeKind::Shell:   return kShellRadius;
     case NodeKind::Monitor: return kMonitorRadius;
     case NodeKind::Tool:    return kToolRadius;
-    case NodeKind::Todo:    return kTodoRadius;
+    case NodeKind::Tasks:   return kTasksRadius;
     case NodeKind::Plan:    return kPlanRadius;
     }
     return kAgentRadius;
@@ -421,13 +446,82 @@ void paintAgent(Node& n, const SubAgent& a)
     }
 }
 
+// Past this the indent eats more width than the nesting is worth showing.
+constexpr int kMaxTaskIndent = 3;
+
+// What a block shows before it starts leaving things out, and how much of that
+// budget goes to what is already finished. A forty-item list is read for what is
+// being worked on and what is left, so the done items are the ones that give way.
+constexpr std::size_t kMaxTaskLines = 9;
+constexpr std::size_t kMaxTaskDone  = 2;
+
+// Drop what a long list can spare, oldest finished item first.
+//
+// What is dropped is still counted: the node keeps the totals and the block says
+// how many it is not showing, so a cut list never reads as a short one.
+void trimTaskLines(std::vector<TaskLine>* lines)
+{
+    if (!lines || lines->size() <= kMaxTaskLines)
+        return;
+
+    std::size_t seenDone = 0;
+    for (const TaskLine& l : *lines) {
+        if (l.done)
+            ++seenDone;
+    }
+
+    std::size_t dropDone = seenDone > kMaxTaskDone ? seenDone - kMaxTaskDone : 0;
+    if (dropDone > 0) {
+        std::vector<TaskLine> kept;
+        kept.reserve(lines->size());
+        for (TaskLine& l : *lines) {
+            if (l.done && dropDone > 0) {
+                --dropDone;
+                continue;
+            }
+            kept.push_back(std::move(l));
+        }
+        *lines = std::move(kept);
+    }
+
+    // Still too long: keep the head, because the active item and everything
+    // blocked behind it are at the top of what is left.
+    if (lines->size() > kMaxTaskLines)
+        lines->resize(kMaxTaskLines);
+}
+
+// Whether a rebuilt block says the same thing as the one already on the node.
+// Only what is drawn is compared, which is what keeps a refresh that changed
+// nothing from waking the simulation.
+bool sameTaskLines(const std::vector<TaskLine>& a, const std::vector<TaskLine>& b)
+{
+    if (a.size() != b.size())
+        return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i].mark != b[i].mark || a[i].depth != b[i].depth || a[i].text != b[i].text)
+            return false;
+    }
+    return true;
+}
+
 // The boxes. Every one of them is square, dim-filled and labelled beside
 // itself; what separates them is the glyph and whether the rim is solid.
 //
-// A solid rim means something is running right now. A broken one means armed
-// but idle, which is what a monitor is between its events and what a todo is
-// before anyone starts it. That distinction is the only state these carry, so
-// it is worth being consistent about.
+// THE RIM IS THE STATE, and it carries exactly one bit. Solid means something
+// is executing this instant: a shell with its output file still held open, the
+// tool call in flight. Broken means armed or inert, nothing running: a monitor
+// between two events is waiting, not working, and a plan is a document that was
+// written once. That is the only state these carry, so every paint function
+// below sets it rather than leaving it to the default, because a rim that is
+// right by accident is one that goes wrong when a node changes hands.
+//
+// THE GLYPH IS THE KIND, one character each and all of them distinct:
+//
+//   >  shell        a command, running
+//   ~  monitor      a watch, armed
+//   .  tool         whatever the session is calling right now
+//   #  task list    the session's items, drawn as a block beside it
+//   =  plan         the plan document it wrote
 void paintShell(Node& n, const BackgroundTask& t)
 {
     n.shape      = NodeShape::Box;
@@ -436,6 +530,7 @@ void paintShell(Node& n, const BackgroundTask& t)
     n.glyph      = QChar('>');
     n.fill       = theme::c(kElevated);
     n.rim        = theme::c(kFg2);
+    n.dashed     = false;
     (void)t;
 }
 
@@ -459,29 +554,18 @@ void paintTool(Node& n)
     n.glyph      = QChar('.');
     n.fill       = theme::c(kSurface);
     n.rim        = theme::c(kFg3);
+    n.dashed     = false;
 }
 
-void paintTodo(Node& n, const TodoItem& item)
+void paintTasks(Node& n)
 {
     n.shape      = NodeShape::Box;
     n.rimWidth   = 1.0;
-    n.labelColor = theme::c(kFg4);
+    n.labelColor = theme::c(kFg3);
+    n.glyph      = QChar('#');
     n.fill       = theme::c(kSurface);
-
-    if (item.done()) {
-        n.glyph = QChar('x');
-        n.rim   = theme::c(kFg4);
-        n.dashed = true;
-    } else if (item.active()) {
-        n.glyph = QChar('>');
-        n.rim   = theme::c(kFg2);
-        n.fill  = theme::c(kElevated);
-        n.labelColor = theme::c(kFg3);
-    } else {
-        n.glyph  = QChar(' ');
-        n.rim    = theme::c(kFg4);
-        n.dashed = true;
-    }
+    n.rim        = theme::c(kFg3);
+    n.dashed     = true;
 }
 
 void paintPlan(Node& n)
@@ -517,10 +601,27 @@ void Camera::retarget(const QRectF& content, qreal elapsedMs)
         return;
     }
 
-    const qreal  sx    = fit_.width() * kFitShrinkSlack;
-    const qreal  sy    = fit_.height() * kFitShrinkSlack;
-    const QRectF slack = content.adjusted(-sx, -sy, sx, sy);
-    if (!fit_.contains(slack)) {
+    // Inside the held fit. Adopt it once the difference is worth a move and has
+    // held, measured on size AND on position.
+    //
+    // Position is the half that was missing, and its absence was not a slow
+    // recentre but no recentre at all. The test used to be whether the fit
+    // contained the content grown by the slack on all four sides, which asks
+    // the content to have shrunk away from every edge at once. Agents do not
+    // leave evenly: when the ones on one side go, the survivors' box is smaller
+    // but sits against the opposite edge, the grown box crosses it, and the
+    // early return fires every frame while zeroing the hold. The camera then
+    // held a box the graph had vacated for as long as the tab stayed open.
+    const qreal sx = fit_.width() * kFitShrinkSlack;
+    const qreal sy = fit_.height() * kFitShrinkSlack;
+
+    const bool smaller = content.width() < fit_.width() - 2.0 * sx
+                      || content.height() < fit_.height() - 2.0 * sy;
+
+    const QPointF drift = content.center() - fit_.center();
+    const bool    moved = std::abs(drift.x()) > sx || std::abs(drift.y()) > sy;
+
+    if (!smaller && !moved) {
         shrinkHeldMs_ = 0;
         return;
     }
@@ -751,6 +852,10 @@ bool NodeGraph::setBoard(const AgentList& board, bool animate)
         std::unordered_map<std::string, int> runChildren;
         std::vector<std::size_t>             agentSlots;
 
+        // Where each live subagent landed, so a shell it opened can hang off it
+        // rather than off the session.
+        std::unordered_map<std::string, std::size_t> agentNodes;
+
         for (const SubAgent& a : card.agents) {
             if (a.state == AgentState::Finished)
                 continue;
@@ -776,6 +881,7 @@ bool NodeGraph::setBoard(const AgentList& board, bool animate)
             changed |= n.rim != rim;
 
             agentSlots.push_back(ai);
+            agentNodes.emplace(a.id, ai);
             if (inRun)
                 ++runChildren[a.workflowRun];
             else
@@ -792,10 +898,11 @@ bool NodeGraph::setBoard(const AgentList& board, bool animate)
         // differs between them is which paint function runs.
         int work = 0;
 
-        const auto box = [&](const std::string& key, NodeKind kind, const QString& label,
-                             const QString& detail, auto&& paint) {
+        const auto boxUnder = [&](const std::string& parent, const std::string& key,
+                                  NodeKind kind, const QString& label, const QString& detail,
+                                  auto&& paint) {
             bool              fresh = false;
-            const std::size_t bi    = touch(key, kind, sKey, animate, &fresh);
+            const std::size_t bi    = touch(key, kind, parent, animate, &fresh);
             changed |= fresh;
 
             Node&        n   = nodes_[bi];
@@ -805,6 +912,14 @@ bool NodeGraph::setBoard(const AgentList& board, bool animate)
             n.detail = detail;
             paint(n);
             changed |= n.rim != rim;
+            return bi;
+        };
+
+        // The common case: a box hanging off the session, counted into the ring
+        // the session hands its own boxes.
+        const auto box = [&](const std::string& key, NodeKind kind, const QString& label,
+                             const QString& detail, auto&& paint) {
+            const std::size_t bi = boxUnder(sKey, key, kind, label, detail, paint);
             ++work;
             return bi;
         };
@@ -822,80 +937,164 @@ bool NodeGraph::setBoard(const AgentList& board, bool animate)
                                     ? QString::fromLatin1(taskKindLabel(t.kind))
                                     : QString::fromStdString(t.label);
 
-            if (t.kind == TaskKind::Monitor) {
-                box(taskKey(card.sessionId, t.id), NodeKind::Monitor, label,
-                    QString::fromStdString(t.tail), [](Node& n) { paintMonitor(n); });
-            } else {
-                box(taskKey(card.sessionId, t.id), NodeKind::Shell, label,
-                    QString::fromStdString(t.tail),
-                    [&t](Node& n) { paintShell(n, t); });
-            }
-        }
-
-        // The tool call in flight. One per session, and only while the session
-        // is actually working: an idle session's last tool call is history, and
-        // a box for it would say the session is still doing something.
-        if (card.column == AgentColumn::Working && !card.activity.empty()) {
-            box(toolKey(card.sessionId), NodeKind::Tool,
-                QString::fromStdString(card.activity), QString(),
-                [](Node& n) { paintTool(n); });
-        }
-
-        // The task list. Finished items are kept: a list is read for how far
-        // through it the session is, and one that drops its completed items
-        // shows the same three boxes all afternoon.
-        //
-        // A blocked item hangs off the item blocking it rather than off the
-        // session, which is what turns a list into the shape it actually has.
-        // The links, the spring and the packing are the ones already here; a
-        // dependency chain is a branch, and nothing had to learn a second kind
-        // of edge to draw one.
-        //
-        // Only backwards, and only to one. Blocking is a graph and this is a
-        // tree: an item can be blocked by several, and blockedBy is written by
-        // something that does not promise the relation is acyclic, so a cycle
-        // would otherwise make two nodes each other's parent. Taking the
-        // earliest blocker by list position cannot close a loop, because every
-        // edge then points at a lower index.
-        std::unordered_map<std::string, std::size_t> order;
-        for (std::size_t i = 0; i < card.todos.size(); ++i)
-            order.emplace(card.todos[i].id, i);
-
-        for (std::size_t i = 0; i < card.todos.size(); ++i) {
-            const TodoItem& item = card.todos[i];
-
-            std::string parent = sKey;
-            std::size_t best   = i;
-            for (const std::string& blocker : item.blockedBy) {
-                const auto at = order.find(blocker);
-                if (at != order.end() && at->second < best) {
-                    best   = at->second;
-                    parent = todoKey(card.sessionId, blocker);
+            // A subagent's shell belongs to the subagent. Every task in a
+            // session shares one directory whoever opened it, so the only thing
+            // that knows this is the agent_id on the hook event, carried here
+            // by the join.
+            //
+            // An agent that has finished is not on the canvas, and neither is
+            // one whose meta file has not been read yet. Its shell falls back
+            // to the session rather than to nothing, the same way an agent
+            // naming a finished run does.
+            std::string owner = sKey;
+            bool        nested = false;
+            if (!t.agentId.empty()) {
+                if (const auto at = agentNodes.find(t.agentId); at != agentNodes.end()) {
+                    owner  = nodes_[at->second].key;
+                    nested = true;
                 }
             }
 
-            const QString label = QString::fromStdString(
-                item.active() && !item.activeForm.empty() ? item.activeForm : item.subject);
+            const std::size_t ti =
+                t.kind == TaskKind::Monitor
+                    ? boxUnder(owner, taskKey(card.sessionId, t.id), NodeKind::Monitor, label,
+                               QString::fromStdString(t.tail), [](Node& n) { paintMonitor(n); })
+                    : boxUnder(owner, taskKey(card.sessionId, t.id), NodeKind::Shell, label,
+                               QString::fromStdString(t.tail),
+                               [&t](Node& n) { paintShell(n, t); });
 
-            bool              fresh = false;
-            const std::size_t bi =
-                touch(todoKey(card.sessionId, item.id), NodeKind::Todo, parent, animate, &fresh);
-            changed |= fresh;
-
-            Node&        n   = nodes_[bi];
-            const QColor rim = n.rim;
-            changed |= n.label != label;
-            n.label  = label;
-            n.detail = QString();
-            paintTodo(n, item);
-            changed |= n.rim != rim;
-
-            // A chained item is not one of the session's own boxes, so it must
-            // not widen the ring they share.
-            if (parent == sKey)
-                ++work;
+            // Only the session's own boxes share the session's ring. One under
+            // an agent sits close to that agent instead, and must not widen a
+            // ring it is not in.
+            if (nested)
+                nodes_[ti].restWorkTarget = kRestAgentWork;
             else
-                nodes_[bi].restWorkTarget = kRestTodoChain;
+                ++work;
+        }
+
+        // Every tool call the session and its subagents made recently, one box
+        // each, keyed by tool_use_id so a call keeps its node across refreshes.
+        //
+        // Each lingers kToolLingerMs from when it started and then goes. That is
+        // a display choice standing in for a fact nobody writes down: nothing
+        // records when a tool call ends, so there is no moment to retire one on.
+        // Without the linger a call would appear and vanish inside a single
+        // refresh, which is what a box popping into existence and out again in
+        // the same frame looks like, and the eye gets nothing from it.
+        //
+        // A call by a subagent hangs off that subagent, the same as its shells.
+        for (const ToolCall& call : card.tools) {
+            if (call.tsMs <= 0 || now - call.tsMs > kToolLingerMs)
+                continue;
+
+            std::string owner  = sKey;
+            bool        nested = false;
+            if (!call.agentId.empty()) {
+                if (const auto at = agentNodes.find(call.agentId); at != agentNodes.end()) {
+                    owner  = nodes_[at->second].key;
+                    nested = true;
+                }
+            }
+
+            const std::size_t ci =
+                boxUnder(owner, toolKey(card.sessionId, call.id), NodeKind::Tool,
+                         QString::fromStdString(call.tool),
+                         QString::fromStdString(call.detail),
+                         [](Node& n) { paintTool(n); });
+
+            if (nested)
+                nodes_[ci].restWorkTarget = kRestAgentWork;
+            else
+                ++work;
+        }
+
+        // The task list, as one block hanging off the session.
+        //
+        // Ordered so the chain reads top to bottom: an item goes straight after
+        // the item blocking it, indented under it. That is a depth-first walk of
+        // the blocking relation, which is what turns blockedBy into something
+        // readable without drawing a single edge.
+        //
+        // Only backwards, and only to one blocker. Blocking is a graph and this
+        // is a walk: an item can be blocked by several, and nothing promises the
+        // relation is acyclic, so taking the earliest blocker by list position
+        // means every edge points at a lower index and a cycle cannot form.
+        if (!card.todos.empty()) {
+            std::unordered_map<std::string, std::size_t> order;
+            for (std::size_t i = 0; i < card.todos.size(); ++i)
+                order.emplace(card.todos[i].id, i);
+
+            const std::size_t                     count = card.todos.size();
+            std::vector<std::vector<std::size_t>> blocked(count);
+            std::vector<std::size_t>              roots;
+
+            for (std::size_t i = 0; i < count; ++i) {
+                std::size_t best = i;
+                for (const std::string& id : card.todos[i].blockedBy) {
+                    const auto at = order.find(id);
+                    if (at != order.end() && at->second < best)
+                        best = at->second;
+                }
+                if (best == i)
+                    roots.push_back(i);
+                else
+                    blocked[best].push_back(i);
+            }
+
+            std::vector<TaskLine> lines;
+            lines.reserve(count);
+            int done = 0;
+
+            // Iterative rather than recursive: the nesting is bounded only by
+            // the list length, and the list is written by something outside
+            // this program.
+            std::vector<std::pair<std::size_t, int>> stack;
+            for (auto it = roots.rbegin(); it != roots.rend(); ++it)
+                stack.emplace_back(*it, 0);
+
+            while (!stack.empty()) {
+                const std::size_t i     = stack.back().first;
+                const int         depth = stack.back().second;
+                stack.pop_back();
+
+                const TodoItem& item = card.todos[i];
+
+                TaskLine line;
+                line.done   = item.done();
+                line.active = item.active();
+                line.mark   = line.done ? QChar('x') : (line.active ? QChar('>') : QChar(' '));
+                line.depth  = std::min(depth, kMaxTaskIndent);
+                line.text   = QString::fromStdString(
+                    line.active && !item.activeForm.empty() ? item.activeForm : item.subject);
+                if (line.done)
+                    ++done;
+                lines.push_back(std::move(line));
+
+                for (auto it = blocked[i].rbegin(); it != blocked[i].rend(); ++it)
+                    stack.emplace_back(*it, depth + 1);
+            }
+
+            const int total = static_cast<int>(lines.size());
+            trimTaskLines(&lines);
+
+            const std::size_t ti = box(tasksKey(card.sessionId), NodeKind::Tasks, QString(),
+                                       QString(), [](Node& b) { paintTasks(b); });
+
+            Node& t = nodes_[ti];
+            if (!sameTaskLines(t.taskLines, lines) || t.taskDone != done || t.taskTotal != total)
+                changed = true;
+
+            // The room the block needs, which is nothing like the size of the
+            // node that anchors it. Rows only: the block is far wider than it is
+            // tall, but widening the footprint to match would shove the whole
+            // cluster sideways, and a circle big enough to cover the text is
+            // worse than one big enough to keep a neighbour out of it.
+            const qreal rows = static_cast<qreal>(lines.size()) + (total > 9 ? 1.0 : 0.0);
+            t.spaceRadius    = kTasksRadius + kTasksRowSpace * rows;
+
+            t.taskLines = std::move(lines);
+            t.taskTotal = total;
+            t.taskDone  = done;
         }
 
         for (const PlanDoc& plan : card.plans) {
@@ -987,8 +1186,16 @@ void NodeGraph::step(qreal dt)
             // Charge is the target radius, not the drawn one: the birth already
             // ramps a newborn in through influence, and scaling by the animated
             // radius as well would double-count it into a nudge.
+            //
+            // And the room a node needs rather than the size it is drawn, which
+            // are the same for everything but a task block. See
+            // Node::spaceRadius: a block is nine rows of text hanging off a node
+            // the size of a full stop, and charging by the dot is what let a
+            // neighbour settle underneath the text.
+            const qreal ra   = a.spaceRadius > 0 ? a.spaceRadius : a.radiusTarget;
+            const qreal rb   = b.spaceRadius > 0 ? b.spaceRadius : b.radiusTarget;
             const qreal soft = std::max(d2, kRepelSoftening * kRepelSoftening);
-            const qreal mag  = kRepelScale * a.radiusTarget * b.radiusTarget
+            const qreal mag  = kRepelScale * ra * rb
                             * (1.0 / soft - 1.0 / (kRepelCutoff * kRepelCutoff));
             if (mag <= 0.0)
                 continue;
@@ -1244,7 +1451,7 @@ QRectF NodeGraph::bounds() const
         // would lunge at whatever was leaving.
         if (n.phase == NodePhase::Dying)
             continue;
-        const qreal r = n.radiusTarget;
+        const qreal r = n.spaceRadius > 0 ? n.spaceRadius : n.radiusTarget;
         if (r <= 0.01)
             continue;
         box = box.united(QRectF(n.pos.x() - r, n.pos.y() - r, 2.0 * r, 2.0 * r));

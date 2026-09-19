@@ -44,8 +44,28 @@ enum class NodeKind {
     Shell,     // a background Bash or PowerShell call, still writing
     Monitor,   // a Monitor watch, still armed
     Tool,      // the tool call in flight this instant
-    Todo,      // one item of the session's task list
+    Tasks,     // the session's whole task list, as one block
     Plan,      // the plan document the session wrote
+};
+
+// One line of a Tasks node's block.
+//
+// The list is drawn as a block rather than as a node per item, which is a
+// deliberate reversal. A node per item is the shape the data has, and it read
+// badly: ten items became ten boxes scattered around the session by a force
+// layout that had no reason to keep them in order, and the one thing a task
+// list is read for, what is being worked on and what is left, took longer to
+// find than it would have in a terminal.
+//
+// The dependency edges survive as `depth`. An item blocked by another is
+// indented under it, so the chain is still visible and costs one glyph of
+// indent instead of an edge the eye has to trace.
+struct TaskLine {
+    QChar   mark;    // 'x' done, '>' in progress, blank otherwise
+    QString text;
+    int     depth  = 0;
+    bool    active = false;
+    bool    done   = false;
 };
 
 // A disc is an agent; a box is work. Two shapes and no more, because a legend
@@ -83,6 +103,21 @@ struct Node {
     qreal radius       = 0;   // chases radiusTarget, so a run grows smoothly
     qreal radiusTarget = 0;
     qreal mass         = 1;
+
+    // How much room this node needs, as against how big it is drawn. Zero means
+    // the two are the same, which is every node but one.
+    //
+    // A task block is nine rows of text beside a node the size of a full stop.
+    // The simulation cannot see text, so without this the layout packs a
+    // neighbour into the space the block is about to be written over, which is
+    // exactly what it did: a session's list was drawn straight through the plan
+    // label of the session above it. Repulsion and the camera's fit read this;
+    // the rim, the glyph and the link trimming read `radius`, so the box stays
+    // the size it looks.
+    qreal spaceRadius = 0;
+
+    // What the forces and the fit should use.
+    qreal footprint() const { return spaceRadius > 0 ? spaceRadius : radius; }
 
     // What this node hands its children as a spring rest length. A session
     // holds three, because its runs sit further out than its own loose agents,
@@ -129,6 +164,14 @@ struct Node {
     // A single character drawn inside a box, which is what makes four kinds of
     // box tell themselves apart at a glance without four colours.
     QChar glyph;
+
+    // Tasks only: the block drawn beside it, already ordered and indented.
+    std::vector<TaskLine> taskLines;
+
+    // How many items the list actually holds, which is not taskLines.size()
+    // once a long list has been cut down to what is worth reading.
+    int taskTotal = 0;
+    int taskDone  = 0;
 
     // A monitor is drawn with a broken rim. It is armed rather than working:
     // nothing is running between its events, and a solid box would claim

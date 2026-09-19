@@ -81,6 +81,12 @@ label   = "Put pm on PATH"
 detail  = "Adds the install directory to the system PATH so `pm` works from any terminal. This is the whole point of the console front end."
 default = true
 
+[[options]]
+id      = "claude_hooks"
+label   = "Register the Claude Code hooks"
+detail  = "Writes to settings.json in your user profile, so the agent board can show what each session is doing. Runs as you, not as the administrator."
+default = true
+
 [[actions]]
 type   = "shortcut"
 target = '{InstallDir}\ProjectMan.exe'
@@ -96,3 +102,48 @@ when  = "add_to_path"
 
 [[actions]]
 type = "arp"
+
+# Register the hooks the agent board and the node explorer read.
+#
+# `as = "user"` is not optional here and is the whole reason this is a hook
+# rather than an action. The file it writes is %USERPROFILE%\.claude\settings.json
+# and this installer elevates, so without it the registration lands in the
+# administrator's profile under over-the-shoulder UAC, and even when the same
+# person elevated, the file comes out owned by BUILTIN\Administrators and Claude
+# Code cannot rewrite it afterwards. Both failures are silent.
+#
+# `pm hook install` is idempotent and repairs an existing registration in place
+# rather than duplicating it, which is what makes it safe on every upgrade. It
+# registers whatever path it is running from, so running it as a payload member
+# is what points the hooks at {InstallDir}\pm.exe and not at wherever the last
+# build happened to be.
+#
+# post_install, not post_extract: nothing here needs the registry or the
+# shortcuts, but there is also no reason to write into somebody's profile before
+# the install itself is known to have worked.
+#
+# Not vital. A hook registration that failed costs the board its detail, and the
+# registry still carries every session, so the product works without it. Failing
+# the whole install over it would be the wrong trade.
+[[hooks.post_install]]
+id     = "claude_hooks"
+run    = "payload:pm.exe"
+args   = ["hook", "install"]
+as     = "user"
+when   = "claude_hooks"
+sha256 = "auto"
+
+# And take them out again, before the binary they point at is deleted. A stale
+# entry in settings.json is not harmless: Claude Code runs it on every tool call
+# in every session, and one naming a path that no longer exists pays a failed
+# process launch each time.
+#
+# Same option gate as the install, evaluated against what was actually chosen,
+# so an install that never registered them does not try to unregister them.
+[[hooks.pre_uninstall]]
+id     = "claude_hooks"
+run    = "payload:pm.exe"
+args   = ["hook", "uninstall"]
+as     = "user"
+when   = "claude_hooks"
+sha256 = "auto"

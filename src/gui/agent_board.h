@@ -166,6 +166,27 @@ struct SubAgent {
 // two views of two different things.
 std::string agentLabel(const SubAgent& a);
 
+// One tool call, as the hook log recorded it starting.
+//
+// Nothing says when a tool call ENDS. PostToolUse is registered for one field
+// and drops everything else (see src/cli/hook.h), and adding a second line per
+// call to learn it would double the busiest event on the machine to show
+// something that is over. So a call has a start and no end, and what is drawn
+// from it lingers for a fixed while and then goes: see kToolLingerMs.
+//
+// That is a display choice standing in for a fact nobody records, and it is the
+// honest one. The alternative, drawing only the single most recent call, is
+// what the board already did, and on a session making three calls a second it
+// showed a box that changed faster than it could be read.
+struct ToolCall {
+    std::string id;        // tool_use_id, which keys the node so it is stable
+    std::string tool;      // "Read", "mcp__mastercontrolprogram__screen_capture"
+    std::string detail;    // claude::toolSummary of the arguments
+    std::string agentId;   // the subagent that called it, empty for the session
+
+    std::int64_t tsMs = 0;
+};
+
 // One Workflow tool run, folded from the three files it writes.
 struct WorkflowRun {
     std::string runId;    // wf_a3f3cbaa-9df
@@ -305,6 +326,11 @@ struct AgentCard {
     std::vector<TodoItem>       todos;
     std::vector<PlanDoc>        plans;
 
+    // The last few tool calls this session and its subagents made, oldest
+    // first, capped at kMaxRecentTools. Whether one is still worth drawing is
+    // decided by its age against the reader's own clock, not here.
+    std::vector<ToolCall> tools;
+
     unsigned long pid = 0;
     std::int64_t  startedAtMs    = 0;
     std::int64_t  lastActivityMs = 0;
@@ -346,6 +372,10 @@ AgentList buildBoard(const std::vector<RegistryEntry>&  registry,
                      const std::vector<BackgroundJob>&  jobs,
                      const std::vector<PlanDoc>&        plans,
                      const ProjectList&                 projects);
+
+// How many tool calls a card keeps. Bounds the list; how long each is drawn is
+// a separate question, answered by whoever draws it.
+inline constexpr std::size_t kMaxRecentTools = 16;
 
 // ------------------------------------------------------------------ locations
 
