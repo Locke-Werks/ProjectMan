@@ -4,6 +4,7 @@
 #include "model.h"
 
 #include <cstdint>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -99,6 +100,7 @@ struct AgentEvent {
     fs::path     cwd;
     std::string  tool;      // PreToolUse only
     std::string  detail;    // see hook.h for what this carries per event
+    std::string  text;      // PreToolUse only: the uncut call (hook.h)
 
     // A subagent keeps its parent's session_id, so without these two an event
     // from inside one is indistinguishable from the parent's own. Empty means
@@ -150,6 +152,17 @@ struct SubAgent {
     std::string workflowRun;   // wf_<id>, empty outside a workflow
     std::string phase;         // the run's phase it belongs to, empty otherwise
     std::string activity;      // its own tool line, from hooks
+
+    // The subagent that spawned this one, empty when the session did. Claude
+    // Code writes every agent of a session into one flat subagents directory
+    // whatever its depth, so this field is the only record of the tree.
+    std::string parentAgentId;
+    int         spawnDepth = 1;
+
+    // The tail of its own transcript, for the terminal pane: what it said, the
+    // tools it called, and the first line of each result. Read per refresh and
+    // only for agents not yet finished; never cached with the meta.
+    std::vector<OutputLine> recent;
 
     AgentState   state          = AgentState::Spawned;
     std::int64_t startedAtMs    = 0;
@@ -216,6 +229,21 @@ std::vector<RegistryEntry> readRegistry(const fs::path& sessionsDir);
 // a half-written line from a session that was killed mid-append must not cost
 // the board every event behind it.
 std::vector<AgentEvent> readEvents(const fs::path& eventLog, std::int64_t sinceMs = 0);
+
+// One tool call as the hook logged it, for the canvas's tool log.
+struct LoggedCall {
+    std::int64_t tsMs = 0;
+    std::string  tool;
+    std::string  text;   // the uncut call, or the 120-char detail an older cxhook wrote
+};
+
+// The PreToolUse lines in `events` (time-ordered, as the log is) past a
+// high-water mark, oldest first. `markMs` and `atMark` are the reader's cursor:
+// the newest timestamp already taken and the calls taken at exactly that
+// millisecond, so a line landing beside one already taken is still new and the
+// taken one is not taken again. Both are advanced.
+std::vector<LoggedCall> takeNewCalls(const std::vector<AgentEvent>& events, std::int64_t& markMs,
+                                     std::set<std::string>& atMark);
 
 // Everything read per session: its own directory, plus the two state
 // directories keyed by session id that live elsewhere.

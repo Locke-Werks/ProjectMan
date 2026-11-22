@@ -7,7 +7,10 @@
 #include <QString>
 #include <QWidget>
 
+#include <cstdint>
 #include <mutex>
+#include <set>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -71,6 +74,10 @@ signals:
     // the board is built once, moved once, and copied only by whoever keeps it.
     void boardReady(const pm::gui::AgentList& board);
 
+    // Tool calls the hook logged since the last emission, oldest first. Only
+    // calls made after the worker started.
+    void toolCallsLogged(const std::vector<pm::gui::LoggedCall>& calls);
+
 private:
     void run();
     void buildAndPost();
@@ -89,6 +96,10 @@ private:
     // Both hold caches keyed by session id and neither is thread-safe.
     SessionFileReader sessions_;
     TaskReader        tasks_;
+
+    // takeNewCalls' cursor. Starts at the worker's start time.
+    std::int64_t          loggedUpToMs_ = 0;
+    std::set<std::string> loggedAtMark_;
 };
 
 // Every Claude Code session on this machine, as four columns of cards that

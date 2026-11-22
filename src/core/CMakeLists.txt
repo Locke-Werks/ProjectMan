@@ -17,6 +17,7 @@ add_library(pm_core STATIC
     workitems.cpp
     launcher.cpp
     claude_stream.cpp
+    tool_summary.cpp
     dispatch_run.cpp
 )
 

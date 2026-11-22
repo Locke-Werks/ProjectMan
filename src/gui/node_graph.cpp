@@ -39,6 +39,12 @@ constexpr qreal kTasksRadius   = 9.0;
 constexpr qreal kTasksRowSpace = 7.0;
 constexpr qreal kPlanRadius    = 9.0;
 
+// The room a terminal pane asks the layout for. A pane is kTermLines rows plus a
+// title bar, about 110 logical pixels tall and far wider; like the task block,
+// the footprint covers its height and lets the width overhang, because a circle
+// wide enough to cover the text would shove the whole cluster apart.
+constexpr qreal kTermSpace = 52.0;
+
 // A run that spawned forty agents should read as a bigger thing than one that
 // spawned two, without reading as a second session. log2 because the difference
 // worth seeing is between 2 and 20, not between 100 and 173.
@@ -855,6 +861,7 @@ bool NodeGraph::setBoard(const AgentList& board, bool animate)
         // Where each live subagent landed, so a shell it opened can hang off it
         // rather than off the session.
         std::unordered_map<std::string, std::size_t> agentNodes;
+        std::unordered_map<std::size_t, std::string> prevParent;
 
         for (const SubAgent& a : card.agents) {
             if (a.state == AgentState::Finished)
@@ -879,6 +886,16 @@ bool NodeGraph::setBoard(const AgentList& board, bool animate)
             n.label = label;
             paintAgent(n, a);
             changed |= n.rim != rim;
+            n.term = a.recent;
+
+            // touch() keeps a node's first parent for ever. An agent's can
+            // change: the nesting pass below moves it under its spawner, and
+            // back here when the spawner finishes. Remember what it was so a
+            // refresh that moves nothing does not wake the simulation.
+            prevParent.emplace(ai, n.parentKey);
+            n.parentKey       = parent;
+            n.restAgentTarget = kRestRunAgent;   // widened below if it has children
+            n.spaceRadius     = n.term.empty() ? 0.0 : kTermSpace;
 
             agentSlots.push_back(ai);
             agentNodes.emplace(a.id, ai);
@@ -887,6 +904,51 @@ bool NodeGraph::setBoard(const AgentList& board, bool animate)
             else
                 ++loose;
         }
+
+        // Agents spawned by agents. Every agent of a session sits in one flat
+        // directory, so the tree is rebuilt here from parentAgentId, after the
+        // pass above has put every live agent on the canvas in whatever order
+        // the directory listed them. A parent that has finished is not on the
+        // canvas, and its child stays where the first pass put it.
+        std::unordered_map<std::size_t, int> agentChildren;
+        for (const SubAgent& a : card.agents) {
+            if (a.state == AgentState::Finished || a.parentAgentId.empty())
+                continue;
+            const auto self   = agentNodes.find(a.id);
+            const auto parent = agentNodes.find(a.parentAgentId);
+            if (self == agentNodes.end() || parent == agentNodes.end()
+                || self->second == parent->second)
+                continue;
+
+            // Refuse a cycle: walk up from the would-be parent and give up if
+            // the walk reaches this agent. The files are written by something
+            // outside this program.
+            bool        cycle = false;
+            std::string up    = a.parentAgentId;
+            for (int guard = 0; !up.empty() && guard < 32; ++guard) {
+                if (up == a.id) {
+                    cycle = true;
+                    break;
+                }
+                const auto at = std::find_if(card.agents.begin(), card.agents.end(),
+                                             [&up](const SubAgent& s) { return s.id == up; });
+                up = at == card.agents.end() ? std::string() : at->parentAgentId;
+            }
+            if (cycle)
+                continue;
+
+            // It was counted into its run or the session above.
+            if (!a.workflowRun.empty() && runs.count(a.workflowRun))
+                --runChildren[a.workflowRun];
+            else
+                --loose;
+            nodes_[self->second].parentKey = nodes_[parent->second].key;
+            ++agentChildren[parent->second];
+        }
+        for (const auto& [slot, kids] : agentChildren)
+            nodes_[slot].restAgentTarget = restFor(kRestRunAgent, kAgentSpacing, kids);
+        for (const auto& [slot, before] : prevParent)
+            changed |= nodes_[slot].parentKey != before;
 
         const bool crowded = agentSlots.size() > static_cast<std::size_t>(kLabelCrowdLimit);
         for (const std::size_t slot : agentSlots)
@@ -907,7 +969,10 @@ bool NodeGraph::setBoard(const AgentList& board, bool animate)
 
             Node&        n   = nodes_[bi];
             const QColor rim = n.rim;
-            changed |= n.label != label || n.detail != detail;
+            // Text is not movement. A shell's detail line changes on nearly
+            // every refresh, and counting it here kept the simulation stepping
+            // for as long as any shell was writing. The panel repaints once per
+            // refresh for text; only structure wakes the physics.
             n.label  = label;
             n.detail = detail;
             paint(n);
@@ -962,6 +1027,9 @@ bool NodeGraph::setBoard(const AgentList& board, bool animate)
                     : boxUnder(owner, taskKey(card.sessionId, t.id), NodeKind::Shell, label,
                                QString::fromStdString(t.tail),
                                [&t](Node& n) { paintShell(n, t); });
+
+            nodes_[ti].term        = t.lines;
+            nodes_[ti].spaceRadius = t.lines.empty() ? 0.0 : kTermSpace;
 
             // Only the session's own boxes share the session's ring. One under
             // an agent sits close to that agent instead, and must not widen a
@@ -1219,7 +1287,7 @@ void NodeGraph::step(qreal dt)
         int slot  = c.parentSlot;
         int guard = 0;
         while (slot >= 0 && nodes_[static_cast<std::size_t>(slot)].kind != NodeKind::Session
-               && guard++ < 4) {
+               && guard++ < 32) {
             slot = nodes_[static_cast<std::size_t>(slot)].parentSlot;
         }
         if (slot < 0)

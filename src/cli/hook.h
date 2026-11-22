@@ -47,6 +47,8 @@ namespace pm::cli {
 //              SubagentStop       empty
 //              SessionEnd         reason
 //
+//   text       PreToolUse only: claude::toolText of tool_input, the whole call
+//
 //   agent      agent_id, present on anything a SUBAGENT did
 //   agentType  agent_type: "Explore", "workflow-subagent", a named agent
 //   toolUse    tool_use_id, PreToolUse and PostToolUse

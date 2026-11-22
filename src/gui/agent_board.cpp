@@ -3,6 +3,9 @@
 #include "claude_files.h"
 #include "json.h"
 #include "strutil.h"
+#include "tool_summary.h"
+
+#include <chrono>
 
 #include <windows.h>
 #include <shlobj.h>
@@ -125,8 +128,211 @@ SubAgent readAgentMeta(const fs::path& file, std::string id, std::string runId)
     a.type        = anyString(&doc, "agentType");
     a.description = anyString(&doc, "description");
     a.phase       = anyString(&doc, "workflowPhase");
+    a.parentAgentId = anyString(&doc, "parentAgentId");
+    if (const json::Value* d = doc.find("spawnDepth"); d && d->type == json::Value::Type::Number)
+        a.spawnDepth = static_cast<int>(d->integer > 0 ? d->integer : d->number);
     return a;
 }
+
+// The first non-empty line of a block, trimmed.
+std::string firstLine(std::string_view text)
+{
+    while (!text.empty()) {
+        const std::size_t nl   = text.find('\n');
+        const std::string_view line = pm::trim(text.substr(0, nl));
+        if (!line.empty())
+            return std::string(line);
+        if (nl == std::string_view::npos)
+            break;
+        text.remove_prefix(nl + 1);
+    }
+    return {};
+}
+
+std::string cutTo(std::string s, std::size_t max)
+{
+    if (s.size() <= max)
+        return s;
+    s.resize(max);
+    while (!s.empty() && (static_cast<unsigned char>(s.back()) & 0xC0) == 0x80)
+        s.pop_back();
+    if (!s.empty())
+        s.pop_back();
+    return s + "...";
+}
+
+// The text of a tool_result's content, which is either a string or an array of
+// typed blocks.
+std::string resultText(const json::Value* content)
+{
+    if (!content)
+        return {};
+    if (content->type == json::Value::Type::String)
+        return content->string;
+    if (content->type != json::Value::Type::Array)
+        return {};
+    for (const json::Value& block : content->array) {
+        if (block.type != json::Value::Type::Object)
+            continue;
+        if (anyString(&block, "type") == "text")
+            return anyString(&block, "text");
+    }
+    return {};
+}
+
+// A transcript is append-only JSONL and only the end is wanted, but a single
+// line can be enormous: a Read of a screenshot stores the image base64 inline,
+// measured at several hundred KB per line on CLI 2.1.330. A small window then
+// lands wholly inside one such line and yields nothing, which is what the first
+// version of this did. So the window is wide, and any line past kMaxParsedLine
+// is not parsed at all: its size alone says it is a payload, not prose.
+constexpr std::int64_t kMaxTranscriptTail = 1024 * 1024;
+constexpr std::size_t  kMaxParsedLine     = 64 * 1024;
+
+std::vector<OutputLine> parseTranscriptTail(const fs::path& file);
+
+// Keyed by path, holding the size and write time the rows were read at. A
+// transcript that has not changed since the last refresh is not read again.
+struct TranscriptCache {
+    std::int64_t            size    = -1;
+    std::int64_t            written = 0;
+    std::vector<OutputLine> rows;
+};
+
+// The last kTermLines rows a subagent's transcript would show in a terminal.
+std::vector<OutputLine> readTranscriptTail(const fs::path& file)
+{
+    static std::unordered_map<std::string, TranscriptCache> cache;
+    if (cache.size() > 512)
+        cache.clear();
+
+    std::error_code    ec;
+    const std::int64_t size    = static_cast<std::int64_t>(fs::file_size(file, ec));
+    const std::int64_t written = fileWriteTimeMs(file);
+    if (ec)
+        return {};
+
+    TranscriptCache& slot = cache[file.string()];
+    if (slot.size == size && slot.written == written)
+        return slot.rows;
+
+    slot.size    = size;
+    slot.written = written;
+    slot.rows    = parseTranscriptTail(file);
+    return slot.rows;
+}
+
+std::vector<OutputLine> parseWindow(const fs::path& file, std::int64_t window);
+
+// Start small and widen only when the tail is one huge line. Nearly always the
+// last 64KB holds a full pane, and parsing a megabyte per busy agent per
+// rebuild was half the program's CPU.
+std::vector<OutputLine> parseTranscriptTail(const fs::path& file)
+{
+    std::vector<OutputLine> rows;
+    for (std::int64_t window = 64 * 1024; window <= kMaxTranscriptTail; window *= 4) {
+        rows = parseWindow(file, window);
+        if (rows.size() >= kTermLines)
+            break;
+    }
+    return rows;
+}
+
+std::vector<OutputLine> parseWindow(const fs::path& file, std::int64_t window)
+{
+    std::vector<OutputLine> rows;
+    const std::string text = readShared(file, window);
+    if (text.empty())
+        return rows;
+
+    std::string_view rest = text;
+    // The window starts mid-line unless it starts at the file's beginning, and
+    // a half line does not parse. Drop it.
+    if (static_cast<std::int64_t>(text.size()) >= window) {
+        const std::size_t nl = rest.find('\n');
+        rest = nl == std::string_view::npos ? std::string_view() : rest.substr(nl + 1);
+    }
+
+    const auto push = [&rows](std::string s, OutputLine::Tone tone) {
+        if (s.empty())
+            return;
+        rows.push_back({cutTo(std::move(s), kTermChars), tone});
+    };
+
+    while (!rest.empty()) {
+        const std::size_t nl   = rest.find('\n');
+        const std::string_view line = rest.substr(0, nl);
+        rest = nl == std::string_view::npos ? std::string_view() : rest.substr(nl + 1);
+        if (line.empty())
+            continue;
+
+        if (line.size() > kMaxParsedLine) {
+            // Only a user turn carries a tool result this size.
+            if (line.find("\"tool_result\"") != std::string_view::npos)
+                push("  [large result]", OutputLine::Tone::Quiet);
+            continue;
+        }
+
+        json::Value doc;
+        std::string error;
+        if (!json::parse(line, &doc, &error) || doc.type != json::Value::Type::Object)
+            continue;
+
+        const std::string type = anyString(&doc, "type");
+        if (type != "assistant" && type != "user")
+            continue;
+        const json::Value* msg = doc.find("message");
+        const json::Value* content = msg ? msg->find("content") : nullptr;
+        if (!content)
+            continue;
+
+        // A user turn whose content is a bare string is the prompt it was given.
+        if (content->type == json::Value::Type::String) {
+            if (type == "user")
+                push(firstLine(content->string), OutputLine::Tone::Quiet);
+            continue;
+        }
+        if (content->type != json::Value::Type::Array)
+            continue;
+
+        for (const json::Value& block : content->array) {
+            if (block.type != json::Value::Type::Object)
+                continue;
+            const std::string kind = anyString(&block, "type");
+            if (kind == "text") {
+                // Each line of what it said, since a paragraph is what a
+                // terminal would scroll.
+                std::string_view body = block.find("text") ? std::string_view(block.find("text")->string)
+                                                           : std::string_view();
+                while (!body.empty()) {
+                    const std::size_t at = body.find('\n');
+                    const std::string_view l = pm::trim(body.substr(0, at));
+                    if (!l.empty())
+                        push(std::string(l), OutputLine::Tone::Plain);
+                    if (at == std::string_view::npos)
+                        break;
+                    body.remove_prefix(at + 1);
+                }
+            } else if (kind == "tool_use") {
+                push("> " + claude::toolSummary(anyString(&block, "name"), block.find("input")),
+                     OutputLine::Tone::Command);
+            } else if (kind == "tool_result") {
+                push("  " + firstLine(resultText(block.find("content"))), OutputLine::Tone::Quiet);
+            }
+        }
+        // Bounded as it goes, so a long window never holds more than it shows.
+        if (rows.size() > kTermLines * 4)
+            rows.erase(rows.begin(), rows.end() - static_cast<std::ptrdiff_t>(kTermLines));
+    }
+
+    if (rows.size() > kTermLines)
+        rows.erase(rows.begin(), rows.end() - static_cast<std::ptrdiff_t>(kTermLines));
+    return rows;
+}
+
+// A transcript quiet for longer than this belongs to an agent that is done or
+// stuck; either way it is not worth a read per refresh.
+constexpr std::int64_t kTranscriptQuietMs = 15 * 60 * 1000;
 
 // Forward only, so the source that knows more decides and the order two sources
 // are read in cannot change the answer.
@@ -396,6 +602,22 @@ void rememberTool(Building& b, const AgentEvent& ev)
         b.card.tools.erase(b.card.tools.begin());
 }
 
+// Matched on the message because the hook log does not record
+// notification_type. Prefix match, so a trailing variation in wording still
+// lands; anything unrecognised is treated as a real question.
+bool isIdleOrReportNotice(const std::string& detail)
+{
+    static constexpr std::string_view kNotQuestions[] = {
+        "Claude is waiting for your input",
+        "Claude Code login successful",
+    };
+    for (std::string_view s : kNotQuestions) {
+        if (detail.compare(0, s.size(), s) == 0)
+            return true;
+    }
+    return false;
+}
+
 void applyEvent(Building& b, const AgentEvent& ev)
 {
     if (b.card.cwd.empty())
@@ -443,6 +665,14 @@ void applyEvent(Building& b, const AgentEvent& ev)
             b.card.prompt = ev.detail;
         answered(b);
     } else if (ev.event == "Notification") {
+        // Two Notifications are not questions. Claude Code sends the idle nag a
+        // minute after any finished turn and nothing clears it but the next
+        // prompt, so counting it put every idle session in NeedsYou for good.
+        // The login notice is a report. Neither has anything to answer.
+        if (isIdleOrReportNotice(ev.detail)) {
+            answered(b);
+            return;
+        }
         b.notice    = ev.detail;
         b.notifying = true;
     } else if (ev.event == "Stop") {
@@ -475,11 +705,17 @@ void applyFiles(Building& b, const SessionFiles& f)
             a.phase = meta.phase;
         if (a.startedAtMs == 0)
             a.startedAtMs = meta.startedAtMs;
+        // Only the files know these two; no hook carries either.
+        if (a.parentAgentId.empty()) {
+            a.parentAgentId = meta.parentAgentId;
+            a.spawnDepth    = meta.spawnDepth;
+        }
+        a.recent = meta.recent;
 
         promote(&a.state, meta.state);
         a.failed = a.failed || meta.failed;
 
-        a.lastActivityMs = std::max(a.lastActivityMs, meta.startedAtMs);
+        a.lastActivityMs = std::max(a.lastActivityMs, meta.lastActivityMs);
     }
 
     b.card.workflows = f.workflows;
@@ -846,6 +1082,7 @@ std::vector<AgentEvent> readEvents(const fs::path& eventLog, std::int64_t sinceM
             e.sessionId = stringField(&doc, "session");
             e.tool      = stringField(&doc, "tool");
             e.detail    = stringField(&doc, "detail");
+            e.text      = stringField(&doc, "text");
             e.agentId   = stringField(&doc, "agent");
             e.agentType = stringField(&doc, "agentType");
             e.toolUseId = stringField(&doc, "toolUse");
@@ -858,6 +1095,33 @@ std::vector<AgentEvent> readEvents(const fs::path& eventLog, std::int64_t sinceM
 
             out.push_back(std::move(e));
         }
+    }
+    return out;
+}
+
+std::vector<LoggedCall> takeNewCalls(const std::vector<AgentEvent>& events, std::int64_t& markMs,
+                                     std::set<std::string>& atMark)
+{
+    std::vector<LoggedCall> out;
+    const std::int64_t      from = markMs;
+    for (const AgentEvent& e : events) {
+        if (e.event != "PreToolUse" || e.tsMs < from)
+            continue;
+
+        // tool_use_id when the line has one; a line without one is told apart
+        // by what it says instead.
+        std::string key = e.toolUseId;
+        if (key.empty())
+            key = e.sessionId + '\x1f' + e.tool + '\x1f' + (e.text.empty() ? e.detail : e.text);
+        if (e.tsMs == from && atMark.contains(key))
+            continue;
+
+        if (e.tsMs > markMs) {
+            markMs = e.tsMs;
+            atMark.clear();
+        }
+        atMark.insert(std::move(key));
+        out.push_back({e.tsMs, e.tool, e.text.empty() ? e.detail : e.text});
     }
     return out;
 }
@@ -936,6 +1200,9 @@ SessionFiles SessionFileReader::read(const std::string& sessionId, const fs::pat
         journals_.clear();
 
     const fs::path subagents = dir / "subagents";
+    const std::int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
 
     // Loose subagents first, then one directory per workflow run. Both hold the
     // same meta files; only the run directory says which run they belong to.
@@ -957,6 +1224,16 @@ SessionFiles SessionFileReader::read(const std::string& sessionId, const fs::pat
                 it = metas_.emplace(id, readAgentMeta(entry.path(), id, runId)).first;
 
             out.agents.push_back(it->second);
+
+            // The transcript sits beside the meta file under the same stem.
+            fs::path transcript = entry.path();
+            transcript.replace_filename("agent-" + id + ".jsonl");
+            const std::int64_t written = fileWriteTimeMs(transcript);
+            if (written > 0 && nowMs - written < kTranscriptQuietMs) {
+                out.agents.back().recent = readTranscriptTail(transcript);
+                out.agents.back().lastActivityMs =
+                    std::max(out.agents.back().lastActivityMs, written);
+            }
         }
     };
 

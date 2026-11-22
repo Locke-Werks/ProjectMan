@@ -161,6 +161,10 @@ struct Node {
     // asked to do.
     QString detail;
 
+    // The terminal pane drawn beside a shell, a monitor or a subagent: its last
+    // few lines of output or transcript. Empty draws the ordinary label instead.
+    std::vector<OutputLine> term;
+
     // A single character drawn inside a box, which is what makes four kinds of
     // box tell themselves apart at a glance without four colours.
     QChar glyph;

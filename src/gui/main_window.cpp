@@ -29,6 +29,7 @@
 #include <QPushButton>
 #include <QResizeEvent>
 #include <QScrollArea>
+#include <QSettings>
 #include <QShortcut>
 #include <QSpinBox>
 #include <QSplitter>
@@ -877,6 +878,27 @@ MainWindow::MainWindow(Config cfg, QWidget* parent)
     // same machine.
     connect(watch_, &BoardController::boardReady, board_, &AgentBoardPanel::setBoard);
     connect(watch_, &BoardController::boardReady, nodes_, &NodeExplorerPanel::setBoard);
+    connect(watch_, &BoardController::toolCallsLogged, nodes_, &NodeExplorerPanel::addToolCalls);
+
+    // K and T on the canvas only. Bare letters at window scope would be eaten
+    // out of the filter box. Kept in HKCU through QSettings, one boolean each.
+    {
+        QSettings settings;
+        nodes_->setLegendVisible(settings.value(QStringLiteral("nodes/legend"), true).toBool());
+        nodes_->setTerminalsVisible(settings.value(QStringLiteral("nodes/terminals"), true).toBool());
+    }
+    auto* legendKey = new QShortcut(QKeySequence(Qt::Key_K), nodes_, [this] {
+        const bool on = !nodes_->legendVisible();
+        nodes_->setLegendVisible(on);
+        QSettings().setValue(QStringLiteral("nodes/legend"), on);
+    });
+    legendKey->setContext(Qt::WidgetWithChildrenShortcut);
+    auto* termKey = new QShortcut(QKeySequence(Qt::Key_T), nodes_, [this] {
+        const bool on = !nodes_->terminalsVisible();
+        nodes_->setTerminalsVisible(on);
+        QSettings().setValue(QStringLiteral("nodes/terminals"), on);
+    });
+    termKey->setContext(Qt::WidgetWithChildrenShortcut);
 
     // The badge stays on one tab. It counts sessions asking for you, and a
     // second red tab for the same fact would be two alarms for one thing.

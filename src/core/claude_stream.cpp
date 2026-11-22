@@ -7,7 +7,6 @@
 namespace pm::claude {
 namespace {
 
-constexpr size_t kSummaryChars = 120;
 constexpr size_t kErrorChars   = 2000;
 
 std::string stringField(const json::Value* object, const char* key)
@@ -53,40 +52,6 @@ std::string oneLine(std::string s, size_t max)
 }
 
 } // namespace
-
-// Declared in the header, so it sits outside the anonymous namespace above. The
-// helpers it uses are still reachable: an anonymous namespace's members are
-// visible in the namespace enclosing it.
-std::string toolSummary(const std::string& name, const json::Value* input)
-{
-    std::string s;
-    if (name == "Bash" || name == "PowerShell") {
-        s = stringField(input, "command");
-    } else if (name == "Read" || name == "Edit" || name == "Write" || name == "MultiEdit") {
-        s = stringField(input, "file_path");
-    } else if (name == "NotebookEdit") {
-        s = stringField(input, "notebook_path");
-    } else if (name == "Grep" || name == "Glob") {
-        s = stringField(input, "pattern");
-        const std::string path = stringField(input, "path");
-        if (!s.empty() && !path.empty())
-            s += " in " + path;
-    }
-
-    if (s.empty())
-        s = stringField(input, "description");
-
-    if (s.empty() && input && input->type == json::Value::Type::Object) {
-        for (const auto& [key, value] : input->object) {
-            if (value.type == json::Value::Type::String && !value.string.empty()) {
-                s = value.string;
-                break;
-            }
-        }
-    }
-
-    return oneLine(std::move(s), kSummaryChars);
-}
 
 namespace {
 

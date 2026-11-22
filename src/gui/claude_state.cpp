@@ -154,6 +154,93 @@ bool parseObject(const fs::path& file, std::int64_t maxBytes, json::Value* out)
 
 } // namespace
 
+namespace {
+
+// CSI (ESC [ ... final byte), OSC (ESC ] ... BEL or ESC \) and two-byte
+// escapes. Anything else below a space except tab is dropped too: a terminal
+// would act on it and the canvas cannot.
+std::string stripAnsi(std::string_view in)
+{
+    std::string out;
+    out.reserve(in.size());
+    for (std::size_t i = 0; i < in.size(); ++i) {
+        const char ch = in[i];
+        if (ch == '\x1b' && i + 1 < in.size()) {
+            const char kind = in[i + 1];
+            i += 1;
+            if (kind == '[') {
+                while (i + 1 < in.size()) {
+                    const unsigned char f = static_cast<unsigned char>(in[++i]);
+                    if (f >= 0x40 && f <= 0x7E)
+                        break;
+                }
+            } else if (kind == ']') {
+                while (i + 1 < in.size()) {
+                    const char f = in[++i];
+                    if (f == '\x07')
+                        break;
+                    if (f == '\x1b' && i + 1 < in.size() && in[i + 1] == '\\') {
+                        ++i;
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if (ch == '\t') {
+            out += "    ";
+            continue;
+        }
+        if (static_cast<unsigned char>(ch) < 0x20)
+            continue;
+        out += ch;
+    }
+    return out;
+}
+
+} // namespace
+
+std::vector<OutputLine> lastLines(const std::string& text, std::size_t count)
+{
+    std::vector<OutputLine> out;
+    if (count == 0)
+        return out;
+
+    // Walk back line by line from the end, which is the only part wanted.
+    std::size_t end = text.size();
+    while (end > 0 && out.size() < count) {
+        std::size_t start = end;
+        while (start > 0 && text[start - 1] != '\n')
+            --start;
+
+        std::string_view line = std::string_view(text).substr(start, end - start);
+        end = start > 0 ? start - 1 : 0;
+
+        // A trailing CR is a CRLF line end; any other is a redraw, and only
+        // what was drawn last is still on screen.
+        while (!line.empty() && line.back() == '\r')
+            line.remove_suffix(1);
+        if (const std::size_t cr = line.rfind('\r'); cr != std::string_view::npos)
+            line.remove_prefix(cr + 1);
+
+        std::string clean = stripAnsi(line);
+        const std::string_view trimmed = pm::trim(clean);
+        if (trimmed.empty())
+            continue;
+
+        // Keep leading indentation, which is layout; drop only the trailing run.
+        std::size_t last = clean.find_last_not_of(' ');
+        clean.resize(last + 1);
+        out.push_back({clip(std::move(clean), kTermChars), OutputLine::Tone::Plain});
+
+        if (start == 0)
+            break;
+    }
+
+    std::reverse(out.begin(), out.end());
+    return out;
+}
+
 const char* taskKindLabel(TaskKind k)
 {
     switch (k) {
@@ -197,11 +284,22 @@ fs::path planRoot()
 
 const fs::path& TaskReader::directoryFor(const std::string& sessionId, const fs::path& cwd)
 {
-    if (const auto at = dirs_.find(sessionId); at != dirs_.end())
-        return at->second;
-
-    fs::path       found;
     const fs::path root = claudeTempRoot();
+
+    if (const auto at = dirs_.find(sessionId); at != dirs_.end()) {
+        // A session that had no tasks when it was first read gets one later,
+        // so a cached miss is re-derived: a string operation and a stat, never
+        // the scan. Returning the cached miss for good hid every shell of a
+        // session that started quiet, for as long as the window stayed open.
+        if (at->second.empty() && !root.empty() && !cwd.empty()) {
+            const fs::path guess = root / cf::projectSlug(cwd) / sessionId / "tasks";
+            if (isDirectory(guess))
+                at->second = guess;
+        }
+        return at->second;
+    }
+
+    fs::path found;
 
     if (!root.empty()) {
         // The derivation, which is right for every directory on this machine.
@@ -245,10 +343,8 @@ std::vector<BackgroundTask> TaskReader::read(const std::string& sessionId, const
     if (dir.empty())
         return out;
 
-    // A session that had no tasks when it was first read gets one later, so a
-    // cached empty path is re-derived the moment the directory appears. The
-    // derivation is a string operation and a stat; only the scan is expensive,
-    // and this never reaches it.
+    // The directory can go as well as come: nothing promises Claude Code keeps
+    // it for the life of the session.
     std::error_code ec;
     if (!fs::is_directory(dir, ec))
         return out;
@@ -283,7 +379,9 @@ std::vector<BackgroundTask> TaskReader::read(const std::string& sessionId, const
         if (!t.writing && (nowMs - t.lastOutputMs) > kStaleMs)
             continue;
 
-        t.tail = clip(lastLine(readShared(e.path(), kMaxTaskBytes)), kTailChars);
+        const std::string body = readShared(e.path(), kMaxTaskBytes);
+        t.tail  = clip(lastLine(body), kTailChars);
+        t.lines = lastLines(body, kTermLines);
 
         out.push_back(std::move(t));
     }

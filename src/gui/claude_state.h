@@ -52,6 +52,34 @@
 // rather than an error, every read shared with its writer, every size capped.
 namespace pm::gui {
 
+// ------------------------------------------------------------ terminal lines
+
+// One row of the miniature terminal drawn beside a shell, a monitor or a
+// subagent. The tone is how the row is inked: a shell's output is all Plain;
+// a subagent's transcript mixes what it said, the tool calls it made, and the
+// first line of what each call returned.
+struct OutputLine {
+    enum class Tone { Plain, Command, Quiet };
+    std::string text;
+    Tone        tone = Tone::Plain;
+};
+
+// How many rows a terminal pane holds. Enough to see a build scroll or an agent
+// think across two tool calls, few enough that twenty panes still fit a screen.
+inline constexpr std::size_t kTermLines = 7;
+
+// Each row is cut to this before it reaches the canvas, which elides it again to
+// whatever width the pane gets.
+inline constexpr std::size_t kTermChars = 200;
+
+// The last `count` non-empty lines of a block of terminal output, oldest first.
+//
+// A carriage return inside a line is a redraw, as a progress bar does it, so
+// only what follows the last one is kept. ANSI escape sequences are removed:
+// they are colour and cursor movement meant for a real terminal, and drawn
+// literally they read as noise.
+std::vector<OutputLine> lastLines(const std::string& text, std::size_t count);
+
 // ------------------------------------------------------------ shells and monitors
 
 // Which tool opened a task. Decided by the hook event that named the task id,
@@ -102,6 +130,10 @@ struct BackgroundTask {
     // now. Cut to kTailChars; the file itself is never held in full.
     std::string tail;
 
+    // The last kTermLines lines, for the terminal pane. `tail` stays separate
+    // because live() reads it and it is cut to a different budget.
+    std::vector<OutputLine> lines;
+
     // Somebody has the output file open for writing. Exact for a shell, always
     // false for a monitor.
     bool writing = false;
@@ -119,11 +151,17 @@ struct BackgroundTask {
     // The monitor answer is an upper bound, not an observation: a watch whose
     // source ends early goes on being drawn until its declared timeout runs
     // out. That is bounded by Monitor's own cap of an hour and usually by its
-    // five-minute default, and it is the honest limit of what disk can say.
+    // five-minute default.
+    //
+    // With one exception: when the watched command itself ends, Claude Code
+    // writes "[exited with code N]" as the file's last line (seen on CLI
+    // 2.1.286), and a monitor whose source has exited has nothing left to
+    // watch. Without this a finished watch sat on the canvas for the rest of
+    // its timeout saying, in its own detail line, that it had exited.
     bool live(std::int64_t nowMs) const
     {
         if (kind == TaskKind::Monitor)
-            return expiresAtMs > 0 && nowMs < expiresAtMs;
+            return expiresAtMs > 0 && nowMs < expiresAtMs && !tail.starts_with("[exited with code ");
         return writing;
     }
 };

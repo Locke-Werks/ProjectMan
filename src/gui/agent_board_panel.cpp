@@ -38,6 +38,11 @@ constexpr DWORD kPollMs = 5000;
 // moment to go quiet and the whole burst costs one rebuild.
 constexpr DWORD kSettleMs = 150;
 
+// The shortest gap between two event-driven rebuilds. Terminal panes want to
+// look live; two updates a second reads as live and costs a fraction of what
+// rebuilding on every hook write did.
+constexpr DWORD kMinRebuildGapMs = 500;
+
 constexpr DWORD kWatchFlags =
     FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE;
 
@@ -307,6 +312,10 @@ void BoardController::run()
             w->rearm();
     };
 
+    // The tool log shows calls made from here on. The log's history is not news.
+    loggedUpToMs_ = QDateTime::currentMSecsSinceEpoch();
+    loggedAtMark_.clear();
+
     buildAndPost();
 
     bool stop = false;
@@ -335,8 +344,17 @@ void BoardController::run()
             consume(again);
         }
 
-        if (!stop)
-            buildAndPost();
+        if (stop)
+            break;
+        buildAndPost();
+
+        // A floor under the rebuild rate. The hook log is appended to on every
+        // tool call of every session, so with a dozen agents busy the settle
+        // above almost never runs out. Waiting on the cancel handle alone keeps
+        // shutdown immediate; whatever fires meanwhile stays pending on its
+        // handle until the loop comes back round.
+        if (WaitForSingleObject(handles[kCancelSlot], kMinRebuildGapMs) == WAIT_OBJECT_0)
+            break;
     }
 }
 
@@ -395,6 +413,13 @@ void BoardController::buildAndPost()
     QMetaObject::invokeMethod(
         this, [this, board = std::move(board)] { emit boardReady(board); },
         Qt::QueuedConnection);
+
+    std::vector<LoggedCall> calls = takeNewCalls(events, loggedUpToMs_, loggedAtMark_);
+    if (!calls.empty()) {
+        QMetaObject::invokeMethod(
+            this, [this, calls = std::move(calls)] { emit toolCallsLogged(calls); },
+            Qt::QueuedConnection);
+    }
 }
 
 // ------------------------------------------------------------ AgentBoardPanel

@@ -5,6 +5,7 @@
 #include "json.h"
 #include "proc.h"
 #include "strutil.h"
+#include "tool_summary.h"
 
 #include <windows.h>
 #include <shlobj.h>
@@ -407,6 +408,14 @@ int receiveBody()
         record.emplace_back("tool", json::makeString(tool));
     if (!detail.empty())
         record.emplace_back("detail", json::makeString(detail));
+
+    // The whole call, uncut, for the canvas tool log. `detail` stays the short
+    // card line so older readers of the log are unaffected.
+    if (preTool) {
+        const std::string text = claude::toolText(tool, payload.find("tool_input"));
+        if (!text.empty())
+            record.emplace_back("text", json::makeString(text));
+    }
 
     // Absent on everything the session did itself, which is most lines, so this
     // costs the log nothing until subagents are actually running.
